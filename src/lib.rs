@@ -91,22 +91,6 @@ pub enum HashAlgorithm {
     Sha512 = FS_VERITY_HASH_ALG_SHA512,
 }
 
-static ZEROES: [u8; 64] = [0; 64];
-
-struct ZeroReader;
-
-impl Read for ZeroReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        buf.fill(0);
-        Ok(buf.len())
-    }
-}
-
-impl BufRead for ZeroReader {
-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> { Ok(&ZEROES) }
-    fn consume(&mut self, _amt: usize) {}
-}
-
 struct FixedSizeBlock<D: Digest> {
     inner: D,
     remaining: usize,
@@ -133,27 +117,16 @@ impl<D: Digest> FixedSizeBlock<D> {
     }
 
     fn finalize(mut self) -> GenericArray<u8, D::OutputSize> {
-        self.fill_from(&mut ZeroReader).unwrap();
+        let zeroes = [0u8; 64];
+        if self.remaining % 64 != 0 {
+            self.append(&zeroes[64 - (self.remaining % 64)..]);
+        }
+        while self.remaining != 0 {
+            self.append(&zeroes);
+        }
         self.inner.finalize()
     }
 
-    fn fill_from<R: BufRead>(&mut self, reader: &mut R) -> std::io::Result<()> {
-
-        loop {
-            let buffer = reader.fill_buf()?;
-            let n = buffer.len().min(self.remaining);
-            if n == 0 { break; }
-            self.append(&buffer[..n]);
-            reader.consume(n);
-        }
-
-        Ok(())
-    }
-
-    fn finalize_from<R: BufRead>(mut self, reader: &mut R) -> std::io::Result<GenericArray<u8, D::OutputSize>> {
-        self.fill_from(reader)?;
-        Ok(self.finalize())
-    }
 }
 
 // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#userspace-utility
@@ -163,8 +136,12 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
 
     let block_size = 4096usize;
 
-    assert!(D::output_size().is_power_of_two() && D::output_size() < block_size);
+    assert!(D::output_size() * 2 < block_size);
     assert!(block_size.is_power_of_two());
+
+    // we require hash size to be a power of two as well, which upstream does not explicitly mention.
+    // see additional commments below.
+    assert!(D::output_size().is_power_of_two());
 
     let salted = D::new().chain(salt);
 
@@ -180,37 +157,36 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
 
     let mut total_size = 0;
 
-    let mut overflow : &[u8];
-
     loop {
         let buffer = input.fill_buf()?;
         if buffer.len() == 0 { break; }
 
         let amount = buffer.len().min(block_size);
-        overflow = &buffer[..amount];
+        let mut overflow = &buffer[..amount];
 
-        let mut i = 0usize;
-        loop {
-            if i >= levels.len() {
-                levels.push(new_block(overflow));
-                break;
-            }
+        let mut is_digest_block = false;
+        for level in levels.iter_mut() {
+
             // this is not *strictly* correct since digests should always be appended atomically,
             // not split between blocks. however, this is always the case as long as the digest size
-            // is a power of two, which is the case for sha256 and sha512 and I suspect will always be
-            // the case. (note that the block size is already defined to be a power of two.)
-            overflow = levels[i].overflowing_append(overflow);
+            // is a power of two, because the block size is already required to be a power of two.
+            // currently only sha256 and sha512 are supported, for which this holds.
+            overflow = level.overflowing_append(overflow);
             if overflow.len() == 0 {
-                // for blocks above 0, we always leave room for 1 more digest.
+                // for digest blocks, we always leave room for 1 more digest.
                 // this simplifies the logic for the flush loop at the end, as it ensures each block
                 // will receive exactly 1 more hash during the flush instead of 1 or 2.
-                if i == 0 || levels[i].remaining >= last_digest.len() {
+                if !is_digest_block || level.remaining >= last_digest.len() {
                     break;
                 }
             }
-            last_digest = std::mem::replace(&mut levels[i], new_block(overflow)).finalize();
+            last_digest = std::mem::replace( level, new_block(overflow)).finalize();
             overflow = &last_digest;
-            i += 1;
+            is_digest_block = true;  // all but the first one
+        }
+
+        if overflow.len() != 0 {
+            levels.push(new_block(overflow));
         }
 
         total_size += amount;
@@ -218,13 +194,11 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
     }
 
     // flush all levels
-    let mut i = 0usize;
-    overflow = &[];
-    while i < levels.len() {
-        levels[i].append(overflow);
-        last_digest = std::mem::replace(&mut levels[i], new_block(&[])).finalize();
+    let mut overflow: &[u8] = &[];
+    for mut level in levels.into_iter() {
+        level.append(overflow);
+        last_digest = level.finalize();
         overflow = &last_digest;
-        i += 1;
     }
 
     // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html
