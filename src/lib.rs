@@ -122,12 +122,14 @@ impl<D: Digest> FixedSizeBlock<D> {
         self.remaining = self.remaining.checked_sub(data.len()).unwrap();
     }
 
-    fn append_if_fits(&mut self, data: &[u8]) -> Result<(), ()> {
+    fn overflowing_append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
         if self.remaining < data.len() {
-            return Err(());
+            self.append(&data[..self.remaining]);
+            &data[self.remaining..]
+        } else {
+            self.append(data);
+            &[]
         }
-        self.append(data);
-        Ok(())
     }
 
     fn finalize(mut self) -> GenericArray<u8, D::OutputSize> {
@@ -141,7 +143,7 @@ impl<D: Digest> FixedSizeBlock<D> {
             let buffer = reader.fill_buf()?;
             let n = buffer.len().min(self.remaining);
             if n == 0 { break; }
-            self.append_if_fits(&buffer[..n]).unwrap();
+            self.append(&buffer[..n]);
             reader.consume(n);
         }
 
@@ -184,15 +186,6 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
         let buffer = input.fill_buf()?;
         if buffer.len() == 0 { break; }
 
-        if levels.len() > 0 && levels[0].remaining != 0 {
-            let amount = buffer.len().min(levels[0].remaining);
-
-            levels[0].append(&buffer[..amount]);
-            total_size += amount;
-            input.consume(amount);
-            continue;
-        }
-
         let amount = buffer.len().min(block_size);
         overflow = &buffer[..amount];
 
@@ -202,13 +195,18 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
                 levels.push(new_block(overflow));
                 break;
             }
-            if levels[i].append_if_fits(overflow).is_ok() {
+            // this is not *strictly* correct since digests should always be appended atomically,
+            // not split between blocks. however, this is always the case as long as the digest size
+            // is a power of two, which is the case for sha256 and sha512 and I suspect will always be
+            // the case. (note that the block size is already defined to be a power of two.)
+            overflow = levels[i].overflowing_append(overflow);
+            if overflow.len() == 0 {
                 // for blocks above 0, we always leave room for 1 more digest.
-                // this ensures the "append_if_fits(overflow).unwrap()" in the flush loop never panics.
+                // this simplifies the logic for the flush loop at the end, as it ensures each block
+                // will receive exactly 1 more hash during the flush instead of 1 or 2.
                 if i == 0 || levels[i].remaining >= last_digest.len() {
                     break;
                 }
-                overflow = &[];
             }
             last_digest = std::mem::replace(&mut levels[i], new_block(overflow)).finalize();
             overflow = &last_digest;
@@ -247,13 +245,13 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
     println!("last_digest: {} size: {}", hex::encode(&last_digest), total_size);
 
     let mut descriptor = FixedSizeBlock::new(salted.clone(), 256);
-    descriptor.append_if_fits(&[1]).unwrap();
-    descriptor.append_if_fits(&[FS_VERITY_HASH_ALG_SHA256]).unwrap();  // FIXME should be dynamic
-    descriptor.append_if_fits(&[block_size.trailing_zeros() as u8]).unwrap();
-    descriptor.append_if_fits(&[salt.len() as u8]).unwrap();  // FIXME check input
-    descriptor.append_if_fits(&[0; 4]).unwrap();
-    descriptor.append_if_fits(&(total_size as u64).to_le_bytes()).unwrap();
-    descriptor.append_if_fits(&last_digest).unwrap();  // FIXME should be dynamic
+    descriptor.append(&[1]);
+    descriptor.append(&[FS_VERITY_HASH_ALG_SHA256]);  // FIXME should be dynamic
+    descriptor.append(&[block_size.trailing_zeros() as u8]);
+    descriptor.append(&[salt.len() as u8]);  // FIXME check input
+    descriptor.append(&[0; 4]);
+    descriptor.append(&(total_size as u64).to_le_bytes());
+    descriptor.append(&last_digest);  // FIXME should be dynamic
 
     // TODO digest always 32 bytes???
     //descriptor.append_if_fits(&salt).unwrap();  // FIXME should be dynamic
