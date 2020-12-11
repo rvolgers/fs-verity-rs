@@ -107,22 +107,15 @@ impl<D: Digest> FixedSizeBlock<D> {
     }
 
     fn overflowing_append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
-        if self.remaining < data.len() {
-            self.append(&data[..self.remaining]);
-            &data[self.remaining..]
-        } else {
-            self.append(data);
-            &[]
-        }
+        let (a, b) = data.split_at(data.len().min(self.remaining));
+        self.append(a);
+        b
     }
 
     fn finalize(mut self) -> GenericArray<u8, D::OutputSize> {
         let zeroes = [0u8; 64];
-        if self.remaining % 64 != 0 {
-            self.append(&zeroes[64 - (self.remaining % 64)..]);
-        }
         while self.remaining != 0 {
-            self.append(&zeroes);
+            self.append(&zeroes[..zeroes.len().min(self.remaining)]);
         }
         self.inner.finalize()
     }
@@ -216,7 +209,7 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
     //     reserved: [u8; 144],   /* must be 0's */
     // }
 
-    println!("last_digest: {} size: {}", hex::encode(&last_digest), total_size);
+    // println!("last_digest: {} size: {}", hex::encode(&last_digest), total_size);
 
     let mut descriptor = FixedSizeBlock::new(salted.clone(), 256);
     descriptor.append(&[1]);
@@ -245,12 +238,23 @@ use crate::HashAlgorithm;
     #[test]
     fn test_testfiles() {
 
+        // 'longfile' takes a while in debug mode, about 20 seconds for me.
+        // in release mode it takes about a second.
         let testfiles = "
         sha256:3d248ca542a24fc62d1c43b916eae5016878e2533c88238480b26128a1f1af95 testfiles/empty
+        sha256:f5c2b9ded1595acfe8a996795264d488dd6140531f6a01f8f8086a83fd835935 testfiles/hashblock_0_0
+        sha256:5c00a54bd1d8341d7bbad060ff1b8e88ed2646d7bb38db6e752cd1cff66c0a78 testfiles/hashblock_0_-1
+        sha256:a7abb76568871169a79104d00679fae6521dfdb2a2648e380c02b10e96e217ff testfiles/hashblock_0_1
+        sha256:c4b519068d8c8c68fd5e362fc3526c5b11e15f8eb72d4678017906f9e7f2d137 testfiles/hashblock_-1_0
+        sha256:09510d2dbb55fa16f2768165c42d19c4da43301dfaa05705b2ecb4aaa4a5686a testfiles/hashblock_1_0
+        sha256:7aa0bb537c623562f898386ac88acd319267e4ab3200f3fd1cf648cfdb4a0379 testfiles/hashblock_-1_-1
+        sha256:f804e9777f91d3697ca015303c23251ad3d80205184cfa3d1066ab28cb906330 testfiles/hashblock_-1_1
+        sha256:26159b4fc68c63881c25c33b23f2583ffaa64fee411af33c3b03238eea56755c testfiles/hashblock_1_-1
+        sha256:57bed0934bf3ab4610d54938f03cff27bd0d9d76c9a77e283f9fb2b7e29c5ab8 testfiles/hashblock_1_1
+        sha256:e228078ebe9c4f7fe0c5d6a76fb2e317f5ea8bdfb227d7741e5c57cff739b5fa testfiles/longfile
         sha256:3fd7a78101899a79cd337b1b4e5414be8bcb376b133370156ef6e65026d930ed testfiles/oneblock
         sha256:c0b9455d545b6b1ee5e7b227bd1ed463aaa530a4840dcd93465163a2b3aff0da testfiles/oneblockplusonebyte
         sha256:9845e616f7d2f7a1cd6742f0546a36d2e74d4eb8ae7d9bdc0b0df982c27861b7 testfiles/onebyte
-        sha256:21ac11f1c7319e1561beb9328375f73c142f7c38c0130f9b799b5290afa051ef testfiles/morelevels
         ".trim().lines().map(|l| {
             let l = l.trim();
             let (digest, path) = l.split_once(" ").unwrap();
@@ -259,8 +263,6 @@ use crate::HashAlgorithm;
             let digest = hex::decode(digest).unwrap();
             (digest_type, digest, path)
         }).collect::<Vec<_>>();
-
-        println!("{:?}", &testfiles);
 
         for (digest_type, digest, path) in testfiles {
             assert!(digest_type == HashAlgorithm::Sha256);
