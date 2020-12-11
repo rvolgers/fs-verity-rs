@@ -166,7 +166,11 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
 
     let salted = D::new().chain(salt);
 
-    let new_block = || FixedSizeBlock::new(salted.clone(), block_size);
+    let new_block = |d: &[u8]| {
+        let mut tmp = FixedSizeBlock::new(salted.clone(), block_size);
+        tmp.append(d);
+        tmp
+    };
 
     let mut last_digest: GenericArray<u8, D::OutputSize> = Default::default();
 
@@ -174,7 +178,7 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
 
     let mut total_size = 0;
 
-    let mut overflow : &[u8] = &[];
+    let mut overflow : &[u8];
 
     loop {
         let buffer = input.fill_buf()?;
@@ -183,7 +187,7 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
         if levels.len() > 0 && levels[0].remaining != 0 {
             let amount = buffer.len().min(levels[0].remaining);
 
-            levels[0].append_if_fits(&buffer[..amount]).unwrap();
+            levels[0].append(&buffer[..amount]);
             total_size += amount;
             input.consume(amount);
             continue;
@@ -195,22 +199,18 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
         let mut i = 0usize;
         loop {
             if i >= levels.len() {
-                levels.push(new_block());
-                levels[i].append_if_fits(overflow).unwrap();
-                overflow = &[];
+                levels.push(new_block(overflow));
                 break;
             }
             if levels[i].append_if_fits(overflow).is_ok() {
-                overflow = &[];
                 // for blocks above 0, we always leave room for 1 more digest.
                 // this ensures the "append_if_fits(overflow).unwrap()" in the flush loop never panics.
                 if i == 0 || levels[i].remaining >= last_digest.len() {
                     break;
                 }
+                overflow = &[];
             }
-            let old_block = std::mem::replace(&mut levels[i], new_block());
-            levels[i].append_if_fits(overflow).unwrap();  // new block, must succeed
-            last_digest = old_block.finalize();
+            last_digest = std::mem::replace(&mut levels[i], new_block(overflow)).finalize();
             overflow = &last_digest;
             i += 1;
         }
@@ -223,9 +223,8 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
     let mut i = 0usize;
     overflow = &[];
     while i < levels.len() {
-        levels[i].append_if_fits(overflow).unwrap();
-        let old_block = std::mem::replace(&mut levels[i], new_block());
-        last_digest = old_block.finalize();
+        levels[i].append(overflow);
+        last_digest = std::mem::replace(&mut levels[i], new_block(&[])).finalize();
         overflow = &last_digest;
         i += 1;
     }
