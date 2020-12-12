@@ -2,7 +2,7 @@
 #![feature(slice_fill)]
 
 // $LINUX/include/uapi/linux/fsverity.h
-use sha2::{Sha512};
+use sha2::{Sha512, digest::{DynDigest, FixedOutput, Reset, Update, impl_write}};
 use std::{os::unix::prelude::AsRawFd};
 use std::io::Write;
 use sha2::{Digest, Sha256};
@@ -88,8 +88,22 @@ pub enum VerityHashAlgorithm {
     Sha512 = FS_VERITY_HASH_ALG_SHA512,
 }
 
+// FIXME make a FsVerity-specific trait implemented by both dyn and static versions.
+//       also, this API does not allow to specify options such as salt.
+trait DynDigestWrite: DynDigest + Write {}
+impl<D: VerityDigestExt + 'static> DynDigestWrite for FsVerityDigest<D> {}
+
+impl Into<Box<dyn DynDigestWrite>> for VerityHashAlgorithm {
+    fn into(self) -> Box<dyn DynDigestWrite> {
+        match self {
+            VerityHashAlgorithm::Sha256 => Box::new(FsVeritySha256::new()),
+            VerityHashAlgorithm::Sha512 => Box::new(FsVeritySha512::new()),
+        }
+    }
+}
+
 /// Extends a Digest with some extra information we need, as well as two useful utility methods.
-pub trait VerityDigestExt: Digest + Clone {
+pub trait VerityDigestExt: Update + FixedOutput + Reset + Default + Clone {
     const VERITY_HASH_ALGORITHM: VerityHashAlgorithm;
     const VERITY_INPUT_BLOCKSIZE: usize;
 
@@ -121,12 +135,12 @@ impl VerityDigestExt for Sha512 {
 /// Logically a fixed-size block of data to be hashed (padded with zeroes if needed.)
 /// Actually remembers only the hash state and how many more bytes are needed.
 #[derive(Clone)]
-struct FixedSizeBlock<D: Digest + VerityDigestExt> {
+struct FixedSizeBlock<D: VerityDigestExt> {
     inner: D,
     remaining: usize,
 }
 
-impl<D: Digest + VerityDigestExt> FixedSizeBlock<D> {
+impl<D: VerityDigestExt> FixedSizeBlock<D> {
     fn new(inner: D, block_size: usize) -> Self {
         Self { inner: inner.clone(), remaining: block_size }
     }
@@ -161,6 +175,7 @@ impl<D: Digest + VerityDigestExt> FixedSizeBlock<D> {
 // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#userspace-utility
 // https://git.kernel.org/pub/scm/linux/kernel/git/ebiggers/fsverity-utils.git/tree/lib/compute_digest.c
 
+#[derive(Clone)]
 pub struct FsVerityDigest<D: VerityDigestExt> {
     block_size: usize,
     salt: Vec<u8>,
@@ -170,9 +185,13 @@ pub struct FsVerityDigest<D: VerityDigestExt> {
     total_size: usize,
 }
 
+impl<D: VerityDigestExt> Default for FsVerityDigest<D> {
+    fn default() -> Self { Self::new() }
+}
+
 impl<D: VerityDigestExt> FsVerityDigest<D> {
     fn new_with_block_size_and_salt(block_size: usize, salt: &[u8]) -> Self {
-        assert!(D::output_size() * 2 <= block_size);
+        assert!(<D as Digest>::output_size() * 2 <= block_size);
         assert!(block_size.is_power_of_two());
 
         assert!(salt.len() <= 32);  // TODO error instead of panic?
@@ -206,8 +225,8 @@ impl<D: VerityDigestExt> FsVerityDigest<D> {
     }
 }
 
-impl<D: VerityDigestExt> Digest for FsVerityDigest<D> {
-    type OutputSize = D::OutputSize;
+
+impl<D: VerityDigestExt> Update for FsVerityDigest<D> {
 
     fn update(&mut self, data: impl AsRef<[u8]>) {
         for chunk in data.as_ref().chunks(self.block_size) {
@@ -232,7 +251,7 @@ impl<D: VerityDigestExt> Digest for FsVerityDigest<D> {
 
                 overflow = level.overflowing_append(overflow);
                 if overflow.len() == 0 {
-                    if !keep_space_for_one_digest || level.remaining >= D::output_size() {
+                    if !keep_space_for_one_digest || level.remaining >= <D as Digest>::output_size() {
                         break;
                     }
                 }
@@ -252,7 +271,12 @@ impl<D: VerityDigestExt> Digest for FsVerityDigest<D> {
         }
     }
 
-    fn finalize(self) -> sha2::digest::Output<Self> {
+}
+
+impl<D: VerityDigestExt> FixedOutput for FsVerityDigest<D> {
+    type OutputSize = D::OutputSize;
+
+    fn finalize_into(self, out: &mut sha2::digest::generic_array::GenericArray<u8, Self::OutputSize>) {
 
         // flush all levels. zero length files are defined to have a root "hash" of all zeroes.
         // the root hash is ambiguous by itself, since it is simply a hash of block_size bytes
@@ -295,41 +319,23 @@ impl<D: VerityDigestExt> Digest for FsVerityDigest<D> {
         descriptor.update_padded(&self.salt, 32);
         descriptor.update_zeroes(144);
 
-        descriptor.finalize()
+        descriptor.finalize_into(out);
     }
 
-    // ***** start of boilerplate and somemwhat suboptimal implementations *****
-
-    fn new() -> Self {
-        <FsVerityDigest<D>>::new()
+    fn finalize_into_reset(&mut self, out: &mut sha2::digest::generic_array::GenericArray<u8, Self::OutputSize>) {
+        std::mem::replace(self, Self::new_with_block_size_and_salt(self.block_size, &self.salt)).finalize_into(out);
     }
+}
 
-    fn finalize_reset(&mut self) -> sha2::digest::Output<Self> {
-        std::mem::replace(self, Self::new_with_block_size_and_salt(self.block_size, &self.salt)).finalize()
-    }
-
+impl<D: VerityDigestExt> Reset for FsVerityDigest<D> {
     fn reset(&mut self) {
-        self.finalize_reset();
+        *self = Self::new_with_block_size_and_salt(self.block_size, &self.salt);
     }
-
-    fn chain(mut self, data: impl AsRef<[u8]>) -> Self where Self: Sized {
-        self.update(data); self
-    }
-
-    fn output_size() -> usize {
-        D::output_size()
-    }
-
-    fn digest(data: &[u8]) -> sha2::digest::Output<Self> {
-        Self::new().chain(data).finalize()
-    }
-
-    // ***** end of boilerplate and somemwhat suboptimal implementations *****
 }
 
 impl<D: VerityDigestExt> Write for FsVerityDigest<D> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.update(buf);
+        Update::update(self, buf);  // FIXME why does self.update() complain about multiple impls?
         Ok(buf.len())
     }
 
@@ -341,10 +347,9 @@ impl<D: VerityDigestExt> Write for FsVerityDigest<D> {
 pub type FsVeritySha256 = FsVerityDigest<Sha256>;
 pub type FsVeritySha512 = FsVerityDigest<Sha512>;
 
-
 #[cfg(test)]
 mod tests {
-use sha2::Digest;
+use crate::DynDigestWrite;
 use std::io::BufReader;
 use std::fs::File;
 use crate::VerityHashAlgorithm;
@@ -381,13 +386,13 @@ use crate::VerityHashAlgorithm;
         for (digest_type, digest, path) in testfiles {
             assert!(digest_type == VerityHashAlgorithm::Sha256);
             let mut f = BufReader::new(File::open(path).unwrap());
-            let mut tmp = crate::FsVeritySha256::new();
+            let mut tmp: Box<dyn DynDigestWrite> = digest_type.into();
             std::io::copy(&mut f, &mut tmp).unwrap();
             let out = tmp.finalize();
 
             let tmp = hex::encode(&digest);
-            let tmp2 = hex::encode(out);
-            assert!(&out.as_ref() == &digest, "expected: {} found: {} for file: {}", tmp, tmp2, path);
+            let tmp2 = hex::encode(&out);
+            assert!(out.as_ref() == &digest, "expected: {} found: {} for file: {}", tmp, tmp2, path);
         }
     }
 }
