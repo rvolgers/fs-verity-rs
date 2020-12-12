@@ -2,14 +2,10 @@
 #![feature(slice_fill)]
 
 // $LINUX/include/uapi/linux/fsverity.h
-use sha2::Sha512;
-use core::fmt::Display;
-use std::{os::unix::prelude::AsRawFd, str::FromStr};
-use std::{io::{BufRead, ErrorKind}, slice};
-use std::cmp::min;
+use sha2::{Sha512};
+use std::{os::unix::prelude::AsRawFd};
 use std::io::Write;
-use std::io::Read;
-use sha2::{Digest, digest::generic_array::GenericArray, Sha256};
+use sha2::{Digest, Sha256};
 
 const FS_VERITY_HASH_ALG_SHA256: u8 = 1;
 const FS_VERITY_HASH_ALG_SHA512: u8 = 2;
@@ -93,7 +89,7 @@ pub enum VerityHashAlgorithm {
 }
 
 /// Extends a Digest with some extra information we need, as well as two useful utility methods.
-pub trait VerityDigestExt: Digest {
+pub trait VerityDigestExt: Digest + Clone {
     const VERITY_HASH_ALGORITHM: VerityHashAlgorithm;
     const VERITY_INPUT_BLOCKSIZE: usize;
 
@@ -124,28 +120,39 @@ impl VerityDigestExt for Sha512 {
 
 /// Logically a fixed-size block of data to be hashed (padded with zeroes if needed.)
 /// Actually remembers only the hash state and how many more bytes are needed.
+#[derive(Clone)]
 struct FixedSizeBlock<D: Digest + VerityDigestExt> {
     inner: D,
     remaining: usize,
 }
 
 impl<D: Digest + VerityDigestExt> FixedSizeBlock<D> {
-    fn new(inner: D, remaining: usize) -> Self { 
-        Self { inner, remaining }
+    fn new(inner: D, block_size: usize) -> Self {
+        Self { inner: inner.clone(), remaining: block_size }
     }
 
+    /// Appends data to block, panics if it doesn't fit.
     fn append(&mut self, data: &[u8]) {
         self.inner.update(data);
         self.remaining = self.remaining.checked_sub(data.len()).unwrap();
     }
 
+    /// Appends as much as possible to the block, returning the data that wouldn't fit.
     fn overflowing_append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
         let (a, b) = data.split_at(self.remaining.min(data.len()));
         self.append(a);
         b
     }
 
-    fn finalize(mut self) -> GenericArray<u8, D::OutputSize> {
+    /// Convenience method for creating a clone of this block with some data appended to it.
+    fn clone_and_append(&self, data: &[u8]) -> Self {
+        let mut tmp = self.clone();
+        tmp.append(data);
+        tmp
+    }
+
+    /// Consume the block and returns its hash
+    fn finalize(mut self) -> sha2::digest::Output<D> {
         self.inner.update_zeroes(self.remaining);
         self.inner.finalize()
     }
@@ -154,138 +161,190 @@ impl<D: Digest + VerityDigestExt> FixedSizeBlock<D> {
 // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#userspace-utility
 // https://git.kernel.org/pub/scm/linux/kernel/git/ebiggers/fsverity-utils.git/tree/lib/compute_digest.c
 
-pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityDigestExt>(input: &mut R, salt: &[u8]) -> std::io::Result<GenericArray<u8, D::OutputSize>> {
+pub struct FsVerityDigest<D: VerityDigestExt> {
+    block_size: usize,
+    salt: Vec<u8>,
+    salted_digest: D,
+    empty_block: FixedSizeBlock<D>,
+    levels: Vec<FixedSizeBlock<D>>,
+    total_size: usize,
+}
 
-    let block_size = 4096usize;  // TODO allow user to pick?
-    assert!(D::output_size() * 2 <= block_size);
-    assert!(block_size.is_power_of_two());
+impl<D: VerityDigestExt> FsVerityDigest<D> {
+    fn new_with_block_size_and_salt(block_size: usize, salt: &[u8]) -> Self {
+        assert!(D::output_size() * 2 <= block_size);
+        assert!(block_size.is_power_of_two());
 
-    assert!(salt.len() <= 32);  // TODO error instead of panic?
+        assert!(salt.len() <= 32);  // TODO error instead of panic?
 
-    // create an immutable hash state initialized with the salt, for use as an initializer.
-    let salted = {
-        let mut tmp = D::new();
-        // salt should be padded up to the "nearest multiple" of the input block size.
-        // but since max salt size is 32, the "multiple" is in practice always 0 or 1.
-        // this ensures that continues to hold in the future.
-        assert!(salt.len() <= D::VERITY_INPUT_BLOCKSIZE);
-        if salt.len() != 0 {
-            tmp.update_padded(salt, D::VERITY_INPUT_BLOCKSIZE);
+        let salted_digest = {
+            let mut tmp = D::new();
+            // salt should be padded up to the "nearest multiple" of the input block size.
+            // but since max salt size is 32, the "multiple" is in practice always 0 or 1.
+            // this ensures that continues to hold in the future.
+            assert!(salt.len() <= D::VERITY_INPUT_BLOCKSIZE);
+            if salt.len() != 0 {
+                tmp.update_padded(salt, D::VERITY_INPUT_BLOCKSIZE);
+            }
+            tmp
+        };
+
+        let empty_block = FixedSizeBlock::new(salted_digest.clone(), block_size);
+
+        Self {
+            block_size,
+            salt: salt.to_owned(),
+            salted_digest,
+            empty_block,
+            levels: vec![],
+            total_size: 0,
         }
-        tmp
-    };
+    }
 
-    // function to create a new FixedSizeBlock with a new pre-salted hash state,
-    // which is then immediately filled with some initial data.
-    let new_block = |d: &[u8]| {
-        let mut tmp = FixedSizeBlock::new(salted.clone(), block_size);
-        tmp.append(d);
-        tmp
-    };
+    fn new() -> Self {
+        FsVerityDigest::new_with_block_size_and_salt(4096, &[])
+    }
+}
 
-    // 'levels' is the currently relevant hierarchy of blocks in the Merkle Tree.
-    // level 0 is filled with the input data. when the block at level n fills up, the hash of
-    // its contents is appended to the block at level n + 1, and it is reset to an empty state.
-    // (this process can repeat if that causes the next level to fill up and so on).
-    // we do not actually keep the content for each block, only the hash state.
-    let mut levels: Vec<FixedSizeBlock<D>> = vec![];
+impl<D: VerityDigestExt> Digest for FsVerityDigest<D> {
+    type OutputSize = D::OutputSize;
 
-    // amount of input data processed so far
-    let mut total_size = 0;
+    fn update(&mut self, data: impl AsRef<[u8]>) {
+        for chunk in data.as_ref().chunks(self.block_size) {
 
-    loop {
-        let buffer = input.fill_buf()?;
-        if buffer.len() == 0 { break; }
+            // invariants that hold before and after this loop:
+            // - level 0 is (once it's created) never empty. it *may* be completely full.
+            // - levels 1..n are never full, they always have room for one more hash. they *may* be empty.
+            // this is implemented using the 'keep_space_for_one_digest' flag which is false for block 0,
+            // and true for all others. the reason for this asymmetry is that it makes flushing the final
+            // state (at the end of file) a lot simpler.
+            // note that due to multiple reasons, the overflowing_append call will only ever split the
+            // data in overflow across two blocks when writing input data (into block 0.) splitting a
+            // digest across two blocks would be incorrect, so it is good that this never happens.
+            // (the first reason is that both block size and currently defined digest sizes are powers of
+            // two, so the block size is always an exact multiple of the digest size. the second reason
+            // is that (as mentioned) we always make sure there is room for an entire digest.)
+            let mut keep_space_for_one_digest = false;
+            let mut last_digest: sha2::digest::Output<Self>;
+            let mut overflow = chunk;
 
-        let amount = buffer.len().min(block_size);
+            for level in self.levels.iter_mut() {
 
-        // invariants that hold before and after this loop:
-        // - level 0 is (once it's created) never empty. it *may* be completely full.
-        // - levels 1..n are never full, they always have room for one more hash. they *may* be empty.
-        // this is implemented using the 'keep_space_for_one_digest' flag which is false for block 0,
-        // and true for all others. the reason for this asymmetry is that it makes flushing the final
-        // state (at the end of file) a lot simpler.
-        // note that due to multiple reasons, the overflowing_append call will only ever split the
-        // data in overflow across two blocks when writing input data (into block 0.) splitting a
-        // digest across two blocks would be incorrect, so it is good that this never happens.
-        // (the first reason is that both block size and currently defined digest sizes are powers of
-        // two, so the block size is always an exact multiple of the digest size. the second reason
-        // is that (as mentioned) we always make sure there is room for an entire digest.)
-        let mut keep_space_for_one_digest = false;
-        let mut last_digest: GenericArray<u8, D::OutputSize>;
-        let mut overflow = &buffer[..amount];
-
-        for level in levels.iter_mut() {
-
-            overflow = level.overflowing_append(overflow);
-            if overflow.len() == 0 {
-                if !keep_space_for_one_digest || level.remaining >= D::output_size() {
-                    break;
+                overflow = level.overflowing_append(overflow);
+                if overflow.len() == 0 {
+                    if !keep_space_for_one_digest || level.remaining >= D::output_size() {
+                        break;
+                    }
                 }
+
+                let new_block = self.empty_block.clone_and_append(overflow);
+                last_digest = std::mem::replace(level, new_block).finalize();
+                overflow = &last_digest;
+
+                keep_space_for_one_digest = true;  // only false for the first loop iteration
             }
 
-            last_digest = std::mem::replace( level, new_block(overflow)).finalize();
+            if overflow.len() != 0 {
+                self.levels.push(self.empty_block.clone_and_append(overflow));
+            }
+
+            self.total_size += chunk.len();
+        }
+    }
+
+    fn finalize(self) -> sha2::digest::Output<Self> {
+
+        // flush all levels. zero length files are defined to have a root "hash" of all zeroes.
+        // the root hash is ambiguous by itself, since it is simply a hash of block_size bytes
+        // of data, and that data could have been either file data or digests of other blocks.
+        // you always need the file size as well to properly interpret the root hash.
+        // since a file size of 0 already uniquely identifies the file's contents there is no
+        // point in even looking at the root hash. I guess fs-verity defines it as all zeroes
+        // to avoid needing to do any hashing at all in that case.
+        let mut last_digest: sha2::digest::Output<Self> = Default::default();
+        let mut overflow: &[u8] = &[];
+        for mut level in self.levels.into_iter() {
+            level.append(overflow);
+            last_digest = level.finalize();
             overflow = &last_digest;
-            keep_space_for_one_digest = true;  // only false for the first loop iteration
         }
 
-        if overflow.len() != 0 {
-            levels.push(new_block(overflow));
-        }
+        // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html
+        // $LINUX/fs/verity/fsverity_private.h
+        // #[repr(C)]
+        // struct fsverity_descriptor {
+        //     version: u8,           /* must be 1 */
+        //     hash_algorithm: u8,    /* Merkle tree hash algorithm */
+        //     log_blocksize: u8,     /* log2 of size of data and tree blocks */
+        //     salt_size: u8,         /* size of salt in bytes; 0 if none */
+        //     sig_size: u32,         /* must be 0 */
+        //     data_size: u64,        /* little-endian size of file the Merkle tree is built over */
+        //     root_hash: [u8; 64],   /* Merkle tree root hash */
+        //     salt: [u8; 32],        /* salt prepended to each hashed block */
+        //     reserved: [u8; 144],   /* must be 0's */
+        // }
 
-        total_size += amount;
-        input.consume(amount);
+        let mut descriptor = self.salted_digest.clone();
+        descriptor.update(&[1]);
+        descriptor.update(&[D::VERITY_HASH_ALGORITHM as u8]);
+        descriptor.update(&[self.block_size.trailing_zeros() as u8]);
+        descriptor.update(&[self.salt.len() as u8]);
+        descriptor.update(&0u32.to_le_bytes());
+        descriptor.update(&(self.total_size as u64).to_le_bytes());
+        descriptor.update_padded(&last_digest, 64);
+        descriptor.update_padded(&self.salt, 32);
+        descriptor.update_zeroes(144);
+
+        descriptor.finalize()
     }
 
-    // flush all levels. zero length files are defined to have a root "hash" of all zeroes.
-    // the root hash is ambiguous by itself, since it is simply a hash of block_size bytes
-    // of data, and that data could have been either file data or digests of other blocks.
-    // you always need the file size as well to properly interpret the root hash.
-    // since a file size of 0 already uniquely identifies the file's contents there is no
-    // point in even looking at the root hash. I guess fs-verity defines it as all zeroes
-    // to avoid needing to do any hashing at all in that case.
-    let mut last_digest: GenericArray<u8, D::OutputSize> = Default::default();
-    let mut overflow: &[u8] = &[];
-    for mut level in levels.into_iter() {
-        level.append(overflow);
-        last_digest = level.finalize();
-        overflow = &last_digest;
+    // ***** start of boilerplate and somemwhat suboptimal implementations *****
+
+    fn new() -> Self {
+        <FsVerityDigest<D>>::new()
     }
 
-    // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html
-    // $LINUX/fs/verity/fsverity_private.h
-    // #[repr(C)]
-    // struct fsverity_descriptor {
-    //     version: u8,           /* must be 1 */
-    //     hash_algorithm: u8,    /* Merkle tree hash algorithm */
-    //     log_blocksize: u8,     /* log2 of size of data and tree blocks */
-    //     salt_size: u8,         /* size of salt in bytes; 0 if none */
-    //     sig_size: u32,         /* must be 0 */
-    //     data_size: u64,        /* little-endian size of file the Merkle tree is built over */
-    //     root_hash: [u8; 64],   /* Merkle tree root hash */
-    //     salt: [u8; 32],        /* salt prepended to each hashed block */
-    //     reserved: [u8; 144],   /* must be 0's */
-    // }
+    fn finalize_reset(&mut self) -> sha2::digest::Output<Self> {
+        std::mem::replace(self, Self::new_with_block_size_and_salt(self.block_size, &self.salt)).finalize()
+    }
 
-    // println!("last_digest: {} size: {}", hex::encode(&last_digest), total_size);
+    fn reset(&mut self) {
+        self.finalize_reset();
+    }
 
-    let mut descriptor = salted.clone();
-    descriptor.update(&[1]);
-    descriptor.update(&[D::VERITY_HASH_ALGORITHM as u8]);
-    descriptor.update(&[block_size.trailing_zeros() as u8]);
-    descriptor.update(&[salt.len() as u8]);
-    descriptor.update(&0u32.to_le_bytes());
-    descriptor.update(&(total_size as u64).to_le_bytes());
-    descriptor.update_padded(&last_digest, 64);
-    descriptor.update_padded(salt, 32);
-    descriptor.update_zeroes(144);
+    fn chain(mut self, data: impl AsRef<[u8]>) -> Self where Self: Sized {
+        self.update(data); self
+    }
 
-    Ok(descriptor.finalize())
+    fn output_size() -> usize {
+        D::output_size()
+    }
+
+    fn digest(data: &[u8]) -> sha2::digest::Output<Self> {
+        Self::new().chain(data).finalize()
+    }
+
+    // ***** end of boilerplate and somemwhat suboptimal implementations *****
 }
+
+impl<D: VerityDigestExt> Write for FsVerityDigest<D> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub type FsVeritySha256 = FsVerityDigest<Sha256>;
+pub type FsVeritySha512 = FsVerityDigest<Sha512>;
+
 
 #[cfg(test)]
 mod tests {
-use sha2::Sha256;
+use sha2::Digest;
 use std::io::BufReader;
 use std::fs::File;
 use crate::VerityHashAlgorithm;
@@ -322,12 +381,13 @@ use crate::VerityHashAlgorithm;
         for (digest_type, digest, path) in testfiles {
             assert!(digest_type == VerityHashAlgorithm::Sha256);
             let mut f = BufReader::new(File::open(path).unwrap());
-            let out = crate::verity_hash::<_, Sha256>(&mut f, &[]).unwrap();
+            let mut tmp = crate::FsVeritySha256::new();
+            std::io::copy(&mut f, &mut tmp).unwrap();
+            let out = tmp.finalize();
+
             let tmp = hex::encode(&digest);
             let tmp2 = hex::encode(out);
             assert!(&out.as_ref() == &digest, "expected: {} found: {} for file: {}", tmp, tmp2, path);
         }
-
-        assert_eq!(2 + 2, 4);
     }
 }
