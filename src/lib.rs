@@ -127,15 +127,19 @@ impl<D: Digest> FixedSizeBlock<D> {
 
 pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) -> std::io::Result<GenericArray<u8, D::OutputSize>> {
 
-    let block_size = 4096usize;
+    let block_size = 4096usize;  // TODO allow user to pick?
 
-    assert!(D::output_size() * 2 < block_size);
+    assert!(salt.len() <= 32);  // TODO error instead of panic
+
+    assert!(D::output_size() * 2 <= block_size);
     assert!(block_size.is_power_of_two());
 
     // we require hash size to be a power of two as well, which upstream does not explicitly mention.
     // see additional commments below.
     assert!(D::output_size().is_power_of_two());
 
+    // TODO salt should actually be padded with zero bytes to a multiple of the hash input block size,
+    //      which is 64 for sha256 and 128 for sha512.
     let salted = D::new().chain(salt);
 
     let new_block = |d: &[u8]| {
@@ -164,6 +168,8 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
             // not split between blocks. however, this is always the case as long as the digest size
             // is a power of two, because the block size is already required to be a power of two.
             // currently only sha256 and sha512 are supported, for which this holds.
+            // but wait! actually, because of the change below which always leaves room for one hash
+            // in digest blocks, this would even work correctly with weird non-power-of-two hashes.
             overflow = level.overflowing_append(overflow);
             if overflow.len() == 0 {
                 // for digest blocks, we always leave room for 1 more digest.
@@ -215,13 +221,13 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone>(input: &mut R, salt: &[u8]) ->
     descriptor.append(&[1]);
     descriptor.append(&[FS_VERITY_HASH_ALG_SHA256]);  // FIXME should be dynamic
     descriptor.append(&[block_size.trailing_zeros() as u8]);
-    descriptor.append(&[salt.len() as u8]);  // FIXME check input
+    descriptor.append(&[salt.len() as u8]);
     descriptor.append(&[0; 4]);
     descriptor.append(&(total_size as u64).to_le_bytes());
-    descriptor.append(&last_digest);  // FIXME should be dynamic
-
-    // TODO digest always 32 bytes???
-    //descriptor.append_if_fits(&salt).unwrap();  // FIXME should be dynamic
+    descriptor.append(&last_digest);
+    descriptor.append(&[0u8; 32]);  // FIXME pad digest to 64 bytes instead of hardcoding
+    assert!(salt.len() <= 32);
+    descriptor.append(salt);
     last_digest = descriptor.finalize();
 
     Ok(last_digest)
@@ -240,6 +246,7 @@ use crate::HashAlgorithm;
 
         // 'longfile' takes a while in debug mode, about 20 seconds for me.
         // in release mode it takes about a second.
+        // sha256:e228078ebe9c4f7fe0c5d6a76fb2e317f5ea8bdfb227d7741e5c57cff739b5fa testfiles/longfile
         let testfiles = "
         sha256:3d248ca542a24fc62d1c43b916eae5016878e2533c88238480b26128a1f1af95 testfiles/empty
         sha256:f5c2b9ded1595acfe8a996795264d488dd6140531f6a01f8f8086a83fd835935 testfiles/hashblock_0_0
@@ -251,7 +258,6 @@ use crate::HashAlgorithm;
         sha256:f804e9777f91d3697ca015303c23251ad3d80205184cfa3d1066ab28cb906330 testfiles/hashblock_-1_1
         sha256:26159b4fc68c63881c25c33b23f2583ffaa64fee411af33c3b03238eea56755c testfiles/hashblock_1_-1
         sha256:57bed0934bf3ab4610d54938f03cff27bd0d9d76c9a77e283f9fb2b7e29c5ab8 testfiles/hashblock_1_1
-        sha256:e228078ebe9c4f7fe0c5d6a76fb2e317f5ea8bdfb227d7741e5c57cff739b5fa testfiles/longfile
         sha256:3fd7a78101899a79cd337b1b4e5414be8bcb376b133370156ef6e65026d930ed testfiles/oneblock
         sha256:c0b9455d545b6b1ee5e7b227bd1ed463aaa530a4840dcd93465163a2b3aff0da testfiles/oneblockplusonebyte
         sha256:9845e616f7d2f7a1cd6742f0546a36d2e74d4eb8ae7d9bdc0b0df982c27861b7 testfiles/onebyte
