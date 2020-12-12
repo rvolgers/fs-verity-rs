@@ -93,9 +93,9 @@ pub enum VerityHashAlgorithm {
 }
 
 /// Extends a Digest with some extra information we need, as well as two useful utility methods.
-pub trait VerityHashExt : Digest {
-    fn verity_hash_algorithm(&self) -> VerityHashAlgorithm;
-    fn verity_input_blocksize(&self) -> usize;
+pub trait VerityDigestExt: Digest {
+    const VERITY_HASH_ALGORITHM: VerityHashAlgorithm;
+    const VERITY_INPUT_BLOCKSIZE: usize;
 
     fn update_padded(&mut self, data: &[u8], padded_size: usize) {
         self.update(data);
@@ -112,34 +112,24 @@ pub trait VerityHashExt : Digest {
     }
 }
 
-impl VerityHashExt for Sha256 {
-    fn verity_hash_algorithm(&self) -> VerityHashAlgorithm {
-        VerityHashAlgorithm::Sha256
-    }
-
-    fn verity_input_blocksize(&self) -> usize {
-        64
-    }
+impl VerityDigestExt for Sha256 {
+    const VERITY_HASH_ALGORITHM: VerityHashAlgorithm = VerityHashAlgorithm::Sha256;
+    const VERITY_INPUT_BLOCKSIZE: usize = 64;
 }
 
-impl VerityHashExt for Sha512 {
-    fn verity_hash_algorithm(&self) -> VerityHashAlgorithm {
-        VerityHashAlgorithm::Sha512
-    }
-
-    fn verity_input_blocksize(&self) -> usize {
-        128
-    }
+impl VerityDigestExt for Sha512 {
+    const VERITY_HASH_ALGORITHM: VerityHashAlgorithm = VerityHashAlgorithm::Sha512;
+    const VERITY_INPUT_BLOCKSIZE: usize = 128;
 }
 
 /// Logically a fixed-size block of data to be hashed (padded with zeroes if needed.)
 /// Actually remembers only the hash state and how many more bytes are needed.
-struct FixedSizeBlock<D: Digest + VerityHashExt> {
+struct FixedSizeBlock<D: Digest + VerityDigestExt> {
     inner: D,
     remaining: usize,
 }
 
-impl<D: Digest + VerityHashExt> FixedSizeBlock<D> {
+impl<D: Digest + VerityDigestExt> FixedSizeBlock<D> {
     fn new(inner: D, remaining: usize) -> Self { 
         Self { inner, remaining }
     }
@@ -150,7 +140,7 @@ impl<D: Digest + VerityHashExt> FixedSizeBlock<D> {
     }
 
     fn overflowing_append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
-        let (a, b) = data.split_at(data.len().min(self.remaining));
+        let (a, b) = data.split_at(self.remaining.min(data.len()));
         self.append(a);
         b
     }
@@ -164,7 +154,7 @@ impl<D: Digest + VerityHashExt> FixedSizeBlock<D> {
 // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#userspace-utility
 // https://git.kernel.org/pub/scm/linux/kernel/git/ebiggers/fsverity-utils.git/tree/lib/compute_digest.c
 
-pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityHashExt>(input: &mut R, salt: &[u8]) -> std::io::Result<GenericArray<u8, D::OutputSize>> {
+pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityDigestExt>(input: &mut R, salt: &[u8]) -> std::io::Result<GenericArray<u8, D::OutputSize>> {
 
     let block_size = 4096usize;  // TODO allow user to pick?
     assert!(D::output_size() * 2 <= block_size);
@@ -178,9 +168,9 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityHashExt>(input: &mut R,
         // salt should be padded up to the "nearest multiple" of the input block size.
         // but since max salt size is 32, the "multiple" is in practice always 0 or 1.
         // this ensures that continues to hold in the future.
-        assert!(salt.len() <= tmp.verity_input_blocksize());
+        assert!(salt.len() <= D::VERITY_INPUT_BLOCKSIZE);
         if salt.len() != 0 {
-            tmp.update_padded(salt, tmp.verity_input_blocksize());
+            tmp.update_padded(salt, D::VERITY_INPUT_BLOCKSIZE);
         }
         tmp
     };
@@ -193,10 +183,14 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityHashExt>(input: &mut R,
         tmp
     };
 
-    // zero length files have a root "hash" of all zeroes. this initializer ensures that.
-    let mut last_digest: GenericArray<u8, D::OutputSize> = Default::default();
-
+    // 'levels' is the currently relevant hierarchy of blocks in the Merkle Tree.
+    // level 0 is filled with the input data. when the block at level n fills up, the hash of
+    // its contents is appended to the block at level n + 1, and it is reset to an empty state.
+    // (this process can repeat if that causes the next level to fill up and so on).
+    // we do not actually keep the content for each block, only the hash state.
     let mut levels: Vec<FixedSizeBlock<D>> = vec![];
+
+    // amount of input data processed so far
     let mut total_size = 0;
 
     loop {
@@ -204,27 +198,35 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityHashExt>(input: &mut R,
         if buffer.len() == 0 { break; }
 
         let amount = buffer.len().min(block_size);
+
+        // invariants that hold before and after this loop:
+        // - level 0 is (once it's created) never empty. it *may* be completely full.
+        // - levels 1..n are never full, they always have room for one more hash. they *may* be empty.
+        // this is implemented using the 'keep_space_for_one_digest' flag which is false for block 0,
+        // and true for all others. the reason for this asymmetry is that it makes flushing the final
+        // state (at the end of file) a lot simpler.
+        // note that due to multiple reasons, the overflowing_append call will only ever split the
+        // data in overflow across two blocks when writing input data (into block 0.) splitting a
+        // digest across two blocks would be incorrect, so it is good that this never happens.
+        // (the first reason is that both block size and currently defined digest sizes are powers of
+        // two, so the block size is always an exact multiple of the digest size. the second reason
+        // is that (as mentioned) we always make sure there is room for an entire digest.)
+        let mut keep_space_for_one_digest = false;
+        let mut last_digest: GenericArray<u8, D::OutputSize>;
         let mut overflow = &buffer[..amount];
 
-        let mut keep_space_for_one_digest = false;
         for level in levels.iter_mut() {
 
             overflow = level.overflowing_append(overflow);
             if overflow.len() == 0 {
-                // for digest blocks, we always leave room for 1 more digest.
-                // this simplifies the logic for the flush loop at the end, as it ensures each block
-                // will receive exactly 1 more hash during the flush instead of 1 or 2.
-                // (this also ensures the "overflowing_append" above does not actually ever split a hash
-                // across two blocks, which is not supposed to happen according to docs. but that can
-                // never happen anyway unless the hash function output size is not a power of two,
-                // which it is for sha256 and sha512 and probably all future hash functions.)
-                if !keep_space_for_one_digest || level.remaining >= last_digest.len() {
+                if !keep_space_for_one_digest || level.remaining >= D::output_size() {
                     break;
                 }
             }
+
             last_digest = std::mem::replace( level, new_block(overflow)).finalize();
             overflow = &last_digest;
-            keep_space_for_one_digest = true;  // all but the first one
+            keep_space_for_one_digest = true;  // only false for the first loop iteration
         }
 
         if overflow.len() != 0 {
@@ -235,7 +237,14 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityHashExt>(input: &mut R,
         input.consume(amount);
     }
 
-    // flush all levels
+    // flush all levels. zero length files are defined to have a root "hash" of all zeroes.
+    // the root hash is ambiguous by itself, since it is simply a hash of block_size bytes
+    // of data, and that data could have been either file data or digests of other blocks.
+    // you always need the file size as well to properly interpret the root hash.
+    // since a file size of 0 already uniquely identifies the file's contents there is no
+    // point in even looking at the root hash. I guess fs-verity defines it as all zeroes
+    // to avoid needing to do any hashing at all in that case.
+    let mut last_digest: GenericArray<u8, D::OutputSize> = Default::default();
     let mut overflow: &[u8] = &[];
     for mut level in levels.into_iter() {
         level.append(overflow);
@@ -262,7 +271,7 @@ pub fn verity_hash<R: BufRead, D: Digest + Clone + VerityHashExt>(input: &mut R,
 
     let mut descriptor = salted.clone();
     descriptor.update(&[1]);
-    descriptor.update(&[salted.verity_hash_algorithm() as u8]);
+    descriptor.update(&[D::VERITY_HASH_ALGORITHM as u8]);
     descriptor.update(&[block_size.trailing_zeros() as u8]);
     descriptor.update(&[salt.len() as u8]);
     descriptor.update(&0u32.to_le_bytes());
