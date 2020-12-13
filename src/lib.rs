@@ -2,13 +2,20 @@
 #![feature(slice_fill)]
 
 // $LINUX/include/uapi/linux/fsverity.h
-use sha2::{Sha512, digest::{DynDigest, FixedOutput, Reset, Update, impl_write}};
-use std::{os::unix::prelude::AsRawFd};
+use sha2::digest::generic_array::typenum::Unsigned;
+use sha2::{Sha512, digest::{BlockInput, DynDigest, FixedOutput, Reset, Update}};
+use std::os::unix::prelude::AsRawFd;
 use std::io::Write;
 use sha2::{Digest, Sha256};
+use num_enum::TryFromPrimitive;
+use std::convert::TryFrom;
 
 const FS_VERITY_HASH_ALG_SHA256: u8 = 1;
 const FS_VERITY_HASH_ALG_SHA512: u8 = 2;
+
+// FIXME these are calculated through complex macros that bindgen doesn't like.
+//       it's also possible they are not the same on all architectures.
+//       should really check this!!!
 const FS_IOC_ENABLE_VERITY: u64 = 1082156677;
 const FS_IOC_MEASURE_VERITY: u64 = 3221513862;
 
@@ -18,33 +25,38 @@ pub struct fsverity_enable_arg {
     pub hash_algorithm: u32,
     pub block_size: u32,
     pub salt_size: u32,
-    pub salt_ptr: u64,
+    pub salt_ptr: *const [u8],
     pub sig_size: u32,
     pub __reserved1: u32,
     pub sig_ptr: u64,
-    pub __reserved2: [u64; 11usize],
+    pub __reserved2: [u64; 11],
 }
 
-const MAX_DIGEST_SIZE: u16 = 32;
+const MAX_DIGEST_SIZE: usize = std::mem::size_of::<sha2::digest::Output<Sha512>>();
+const MAX_SALT_SIZE: usize = 32;
 const MAX_BLOCK_SIZE: usize = 4096;
+const DEFAULT_BLOCK_SIZE: usize = 4096;
 
 #[repr(C)]
 struct fsverity_digest {
     digest_algorithm: u16,
     digest_size: u16,
-    digest: [u8; MAX_DIGEST_SIZE as usize],
+    digest: [u8; MAX_DIGEST_SIZE],
 }
 
-
-fn f_enable_verity(fd: impl AsRawFd) -> std::io::Result<()> {
+fn f_enable_verity(fd: impl AsRawFd, block_size: usize, hash: VerityHashAlgorithm, salt: &[u8]) -> std::io::Result<()> {
     let fd = fd.as_raw_fd();
+
+    assert!(salt.len() <= MAX_SALT_SIZE);
+    assert!(block_size <= MAX_BLOCK_SIZE);
+    assert!(block_size.is_power_of_two());
 
     let args = fsverity_enable_arg {
         version: 1,
-        hash_algorithm: FS_VERITY_HASH_ALG_SHA256 as u32,
-        block_size: 4096,
-        salt_size: 0,
-        salt_ptr: 0,
+        hash_algorithm: hash as u32,
+        block_size: block_size as u32,
+        salt_size: salt.len() as u32,
+        salt_ptr: salt as *const _,
         sig_size: 0,
         __reserved1: Default::default(),
         sig_ptr: 0,
@@ -61,13 +73,13 @@ fn f_enable_verity(fd: impl AsRawFd) -> std::io::Result<()> {
     }
 }
 
-fn f_measure_verity(fd: impl AsRawFd) -> std::io::Result<fsverity_digest> {
+fn f_measure_verity(fd: impl AsRawFd) -> std::io::Result<(VerityHashAlgorithm, Vec<u8>)> {
     let fd = fd.as_raw_fd();
 
     let mut digest = fsverity_digest {
         digest_algorithm: 0,  // unset
-        digest_size: MAX_DIGEST_SIZE,
-        digest: Default::default(),
+        digest_size: MAX_DIGEST_SIZE as u16,
+        digest: [0; MAX_DIGEST_SIZE],
     };
 
     let ret = unsafe { libc::ioctl(fd, FS_IOC_MEASURE_VERITY, &mut digest as *mut _) };
@@ -76,11 +88,11 @@ fn f_measure_verity(fd: impl AsRawFd) -> std::io::Result<fsverity_digest> {
         Err(std::io::Error::from_raw_os_error(ret))
     }
     else {
-        Ok(digest)
+        Ok((VerityHashAlgorithm::try_from(digest.digest_algorithm as u8).unwrap(), digest.digest[..digest.digest_size as usize].to_owned()))
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, parse_display::FromStr, parse_display::Display, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, parse_display::FromStr, parse_display::Display, Debug, TryFromPrimitive)]
 #[display(style = "lowercase")]
 #[repr(u8)]
 pub enum VerityHashAlgorithm {
@@ -103,9 +115,8 @@ impl Into<Box<dyn DynDigestWrite>> for VerityHashAlgorithm {
 }
 
 /// Extends a Digest with some extra information we need, as well as two useful utility methods.
-pub trait VerityDigestExt: Update + FixedOutput + Reset + Default + Clone {
+pub trait VerityDigestExt: Update + FixedOutput + Reset + Default + Clone + BlockInput {
     const VERITY_HASH_ALGORITHM: VerityHashAlgorithm;
-    const VERITY_INPUT_BLOCKSIZE: usize;
 
     fn update_padded(&mut self, data: &[u8], padded_size: usize) {
         self.update(data);
@@ -124,12 +135,10 @@ pub trait VerityDigestExt: Update + FixedOutput + Reset + Default + Clone {
 
 impl VerityDigestExt for Sha256 {
     const VERITY_HASH_ALGORITHM: VerityHashAlgorithm = VerityHashAlgorithm::Sha256;
-    const VERITY_INPUT_BLOCKSIZE: usize = 64;
 }
 
 impl VerityDigestExt for Sha512 {
     const VERITY_HASH_ALGORITHM: VerityHashAlgorithm = VerityHashAlgorithm::Sha512;
-    const VERITY_INPUT_BLOCKSIZE: usize = 128;
 }
 
 /// Logically a fixed-size block of data to be hashed (padded with zeroes if needed.)
@@ -178,10 +187,18 @@ impl<D: VerityDigestExt> FixedSizeBlock<D> {
 #[derive(Clone)]
 pub struct FsVerityDigest<D: VerityDigestExt> {
     block_size: usize,
-    salt: Vec<u8>,
+    salt: Box<[u8]>,
+    /// Digest state pre-initialized with the salt. Cloned whenever we need that.
     salted_digest: D,
+    /// Cloned whenever we need a new empty block.
     empty_block: FixedSizeBlock<D>,
+    /// The currently relevant hierarchy of blocks in the Merkle Tree.
+    /// Level 0 is filled with the input data. when the block at level n fills up, the hash of
+    /// its contents is appended to the block at level n + 1, and it is reset to an empty state.
+    /// (this process can repeat if that causes the next level to fill up and so on).
+    /// We do not actually keep the content for each block, only the hash state.
     levels: Vec<FixedSizeBlock<D>>,
+    /// Amount of input data processed so far
     total_size: usize,
 }
 
@@ -191,19 +208,20 @@ impl<D: VerityDigestExt> Default for FsVerityDigest<D> {
 
 impl<D: VerityDigestExt> FsVerityDigest<D> {
     fn new_with_block_size_and_salt(block_size: usize, salt: &[u8]) -> Self {
-        assert!(<D as Digest>::output_size() * 2 <= block_size);
+        // TODO error instead of panic?
         assert!(block_size.is_power_of_two());
+        assert!(block_size <= MAX_BLOCK_SIZE);
+        assert!(D::OutputSize::to_usize() * 2 <= block_size);
+        assert!(salt.len() <= MAX_SALT_SIZE);
 
-        assert!(salt.len() <= 32);  // TODO error instead of panic?
+        // salt should be padded up to the "nearest multiple" of the input block size.
+        // assert that in practice this "multiple" is 0 or 1, due to the low MAX_SALT_SIZE.
+        assert!(MAX_SALT_SIZE <= D::BlockSize::to_usize());
 
         let salted_digest = {
             let mut tmp = D::new();
-            // salt should be padded up to the "nearest multiple" of the input block size.
-            // but since max salt size is 32, the "multiple" is in practice always 0 or 1.
-            // this ensures that continues to hold in the future.
-            assert!(salt.len() <= D::VERITY_INPUT_BLOCKSIZE);
             if salt.len() != 0 {
-                tmp.update_padded(salt, D::VERITY_INPUT_BLOCKSIZE);
+                tmp.update_padded(salt, D::BlockSize::to_usize());
             }
             tmp
         };
@@ -212,7 +230,7 @@ impl<D: VerityDigestExt> FsVerityDigest<D> {
 
         Self {
             block_size,
-            salt: salt.to_owned(),
+            salt: salt.into(),
             salted_digest,
             empty_block,
             levels: vec![],
@@ -221,7 +239,7 @@ impl<D: VerityDigestExt> FsVerityDigest<D> {
     }
 
     fn new() -> Self {
-        FsVerityDigest::new_with_block_size_and_salt(4096, &[])
+        FsVerityDigest::new_with_block_size_and_salt(DEFAULT_BLOCK_SIZE, &[])
     }
 }
 
@@ -251,7 +269,7 @@ impl<D: VerityDigestExt> Update for FsVerityDigest<D> {
 
                 overflow = level.overflowing_append(overflow);
                 if overflow.len() == 0 {
-                    if !keep_space_for_one_digest || level.remaining >= <D as Digest>::output_size() {
+                    if !keep_space_for_one_digest || level.remaining >= D::OutputSize::to_usize() {
                         break;
                     }
                 }
@@ -276,7 +294,7 @@ impl<D: VerityDigestExt> Update for FsVerityDigest<D> {
 impl<D: VerityDigestExt> FixedOutput for FsVerityDigest<D> {
     type OutputSize = D::OutputSize;
 
-    fn finalize_into(self, out: &mut sha2::digest::generic_array::GenericArray<u8, Self::OutputSize>) {
+    fn finalize_into(self, out: &mut sha2::digest::Output<Self>) {
 
         // flush all levels. zero length files are defined to have a root "hash" of all zeroes.
         // the root hash is ambiguous by itself, since it is simply a hash of block_size bytes
@@ -316,13 +334,13 @@ impl<D: VerityDigestExt> FixedOutput for FsVerityDigest<D> {
         descriptor.update(&0u32.to_le_bytes());
         descriptor.update(&(self.total_size as u64).to_le_bytes());
         descriptor.update_padded(&last_digest, 64);
-        descriptor.update_padded(&self.salt, 32);
+        descriptor.update_padded(&self.salt, MAX_SALT_SIZE);
         descriptor.update_zeroes(144);
 
         descriptor.finalize_into(out);
     }
 
-    fn finalize_into_reset(&mut self, out: &mut sha2::digest::generic_array::GenericArray<u8, Self::OutputSize>) {
+    fn finalize_into_reset(&mut self, out: &mut sha2::digest::Output<Self>) {
         std::mem::replace(self, Self::new_with_block_size_and_salt(self.block_size, &self.salt)).finalize_into(out);
     }
 }
