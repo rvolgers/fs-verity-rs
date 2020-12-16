@@ -130,6 +130,10 @@ impl<D> FsVerityDigest<D> where D: InnerHash {
 
 impl<D, S> FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
 
+    pub fn inner_hash_algorithm(&self) -> InnerHashAlgorithm {
+        D::VERITY_HASH_ALGORITHM
+    }
+
     /// Creates a new instance of `FsVerityDigest` with the given salt. The salt will be mixed
     /// into every internal hash calculation.
     ///

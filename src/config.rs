@@ -1,4 +1,3 @@
-use std::io::Write;
 use num_enum::TryFromPrimitive;
 
 // source for these two: https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-verity-descriptor

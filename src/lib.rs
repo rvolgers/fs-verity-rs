@@ -6,7 +6,7 @@ mod config;
 pub use config::*;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
 
 mod digest;
 
