@@ -58,8 +58,8 @@ struct FixedSizeBlock<D> where D: InnerHash {
 }
 
 impl<D> FixedSizeBlock<D> where D: InnerHash {
-    fn new(inner: D, block_size: usize) -> Self {
-        Self { inner: inner.clone(), remaining: block_size }
+    fn new<S: AsRef<[u8]> + Clone + Default>(config: &FsVerityConfig<D, S>) -> Self {
+        Self { inner: config.salted_digest(), remaining: config.block_size }
     }
 
     /// Appends data to block, panics if it doesn't fit.
@@ -88,21 +88,47 @@ impl<D> FixedSizeBlock<D> where D: InnerHash {
     }
 
     /// Return the final hash of the block, and then reset its state to a copy of the given block.
-    fn finalize_into_and_reset_from(&mut self, dest: &mut digest::Output<D>, template: &Self) {
+    fn finalize_into_and_reset_from<S: AsRef<[u8]> + Clone + Default>(&mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
         self.fill_to_end();
         // using the dirty variant is okay because we overwrite all our state right after this
         self.inner.finalize_into_dirty(dest);
-        self.clone_from(template);
+        *self = Self::new(config);
+    }
+}
+
+#[derive(Clone)]
+pub struct FsVerityConfig<D=Sha256, S=[u8; 0]> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+    block_size: usize,
+    /// We have to keep the actual salt around (not just its digest) as it is needed for the final hash operation.
+    salt: S,
+    salted_digest: D,
+}
+
+impl<D, S> FsVerityConfig<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+    fn new(block_size: usize, salt: S) -> Self {
+        // TODO error instead of panic?
+        assert!(salt.as_ref().len() <= MAX_SALT_SIZE);
+        assert!(block_size.is_power_of_two());
+        assert!(block_size >= D::digest_output_size() * 2);
+        assert!(D::digest_output_size() <= MAX_DIGEST_SIZE);
+
+        let salted_digest = salted_digest(salt.as_ref());
+
+        Self {
+            block_size,
+            salt,
+            salted_digest,
+        }
+    }
+
+    fn salted_digest(&self) -> D {
+        self.salted_digest.clone()
     }
 }
 
 #[derive(Clone)]
 pub struct FsVerityDigest<D=Sha256, S=[u8; 0]> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
-    block_size: usize,
-    /// We have to keep the actual salt around (not just its digest) as it is needed for the final hash operation.
-    salt: S,
-    /// Cloned whenever we need a new empty block.
-    empty_block: FixedSizeBlock<D>,
+    config: FsVerityConfig<D, S>,
     /// The currently relevant hierarchy of blocks in the Merkle tree.
     levels: Vec<FixedSizeBlock<D>>,
 }
@@ -157,18 +183,10 @@ impl<D, S> FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
     /// digests produced by the inner hash algorithm. This code will panic otherwise.
     pub fn new_with_salt_and_block_size(salt: S, block_size: usize) -> Self {
 
-        // TODO error instead of panic?
-        assert!(salt.as_ref().len() <= MAX_SALT_SIZE);
-        assert!(block_size.is_power_of_two());
-        assert!(block_size >= D::digest_output_size() * 2);
-        assert!(D::digest_output_size() <= MAX_DIGEST_SIZE);
-
-        let empty_block = FixedSizeBlock::new(salted_digest(salt.as_ref()), block_size);
+        let config = FsVerityConfig::new(block_size, salt);
 
         Self {
-            block_size,
-            salt,
-            empty_block,
+            config,
             levels: vec![],
         }
     }
@@ -196,7 +214,7 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
         // the reason for the asymmetry between flushing of level[0] and the others is that it makes
         // flushing the final state (at the end of file) a lot simpler, because it guarantees that
         // each level will produce exactly one more digest for the next level during the final flush.
-        for chunk in data.as_ref().chunks(self.block_size) {
+        for chunk in data.as_ref().chunks(self.config.block_size) {
 
             // keep moving up the hierarchy as long as dealing with the current level produces data
             // that needs to be appended to the next level.
@@ -227,7 +245,7 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
                 // can't write directly into last_digest because overflow is (sometimes) a
                 // reference to last_digest, so we have to wait until we're done with overflow.
                 let mut tmp: digest::Output<Self> = Default::default();
-                level.finalize_into_and_reset_from(&mut tmp, &self.empty_block);
+                level.finalize_into_and_reset_from(&mut tmp, &self.config);
                 level.append(overflow);
                 last_digest = tmp;
 
@@ -243,7 +261,7 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
                 // more bytes than can be counted with an u64 before hitting this.
                 assert!(self.levels.len() < MAX_LEVELS);
 
-                let mut level = self.empty_block.clone();
+                let mut level = FixedSizeBlock::new(&self.config);
                 level.append(overflow);
                 self.levels.push(level);
             }
@@ -256,7 +274,7 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
 
     fn finalize_into_dirty(&mut self, out: &mut digest::Output<D>) {
 
-        // a block is self.block_size bytes; a digest is D::digest_output_size() bytes.
+        // a block is block_size bytes; a digest is D::digest_output_size() bytes.
         // dividing them gives the "compression factor", meaning how many times smaller the
         // representation of the data becomes each time it moves up a level in the tree.
         // this means that for every level we go up, each byte in that level represents
@@ -265,7 +283,7 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         // of bytes written to each level. this is needed to calculate the final digest.
         // we could also have tracked the number of bytes written directly of course, but
         // besides showing off I guess this is a good consistency check.
-        let compression_factor = self.block_size / D::digest_output_size();
+        let compression_factor = self.config.block_size / D::digest_output_size();
         let mut total_size: usize = 0;
         let mut scale: usize = 1;  // at level[0], each byte represents 1 input byte
 
@@ -280,7 +298,7 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         let mut last_digest: digest::Output<Self> = Default::default();
         let mut overflow: &[u8] = &[];
         for mut level in self.levels.drain(..) {
-            total_size += scale * (self.block_size - level.remaining);
+            total_size += scale * (self.config.block_size - level.remaining);
             level.append(overflow);
             level.finalize_into(&mut last_digest);
             overflow = &last_digest;
@@ -292,15 +310,15 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         // and it is called a 'verity measurement'.
         // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-verity-descriptor
 
-        let mut descriptor: D = salted_digest(self.salt.as_ref());
+        let mut descriptor: D = salted_digest(self.config.salt.as_ref());
         descriptor.update(&[1]);
         descriptor.update(&[D::VERITY_HASH_ALGORITHM as u8]);
-        descriptor.update(&[self.block_size.trailing_zeros() as u8]);
-        descriptor.update(&[self.salt.as_ref().len() as u8]);
+        descriptor.update(&[self.config.block_size.trailing_zeros() as u8]);
+        descriptor.update(&[self.config.salt.as_ref().len() as u8]);
         descriptor.update(&[0; 4]);
         descriptor.update(&(total_size as u64).to_le_bytes());
         descriptor.update_padded(&last_digest, MAX_DIGEST_SIZE);
-        descriptor.update_padded(self.salt.as_ref(), MAX_SALT_SIZE);
+        descriptor.update_padded(self.config.salt.as_ref(), MAX_SALT_SIZE);
         descriptor.update_zeroes(144);
 
         descriptor.finalize_into(out);
@@ -322,7 +340,7 @@ impl<D, S> BlockInput for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]
 impl<D, S> Reset for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
     fn reset(&mut self) {
         // Pretty basic implementation but good enough
-        *self = Self::new_with_salt_and_block_size(self.salt.clone(), self.block_size);
+        *self = Self::new_with_salt_and_block_size(self.config.salt.clone(), self.config.block_size);
     }
 }
 
