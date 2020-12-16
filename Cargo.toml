@@ -12,3 +12,7 @@ libc = "0.2.81"
 parse-display = "0.4.0"
 hex = "0.4.2"
 num_enum = "0.5.1"
+
+[features]
+default = ["lightweight"]
+lightweight = []

@@ -1,7 +1,7 @@
 use sha2::digest;
 use digest::{FixedOutputDirty, BlockInput, FixedOutput, Reset, Update};
 use sha2::{Sha256, Sha512};
-use std::io::Write;
+use std::{io::Write, iter::repeat};
 
 use crate::config::*;
 
@@ -51,12 +51,14 @@ impl InnerHash for Sha512 {
 /// Logically this represents a fixed-size block of data to be hashed (padded with zeroes if needed.)
 /// It actually remembers only the hash state and how many more bytes are needed, not the data itself.
 /// But that's an implementation detail.
+#[cfg(feature="lightweight")]
 #[derive(Clone)]
 struct FixedSizeBlock<D> where D: InnerHash {
     inner: D,
     remaining: usize,
 }
 
+#[cfg(feature="lightweight")]
 impl<D> FixedSizeBlock<D> where D: InnerHash {
     fn new<S: AsRef<[u8]> + Clone + Default>(config: &FsVerityConfig<D, S>) -> Self {
         Self { inner: config.salted_digest(), remaining: config.block_size }
@@ -82,17 +84,65 @@ impl<D> FixedSizeBlock<D> where D: InnerHash {
     }
 
     // Returns the final hash of the block, consuming it.
-    fn finalize_into(mut self, dest: &mut digest::Output<D>) {
+    fn finalize_into<S: AsRef<[u8]> + Clone + Default>(mut self, dest: &mut digest::Output<D>, _config: &FsVerityConfig<D, S>) {
         self.fill_to_end();
         self.inner.finalize_into(dest);
     }
 
     /// Return the final hash of the block, and then reset its state to a copy of the given block.
-    fn finalize_into_and_reset_from<S: AsRef<[u8]> + Clone + Default>(&mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
+    fn finalize_into_and_reset<S: AsRef<[u8]> + Clone + Default>(&mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
         self.fill_to_end();
         // using the dirty variant is okay because we overwrite all our state right after this
         self.inner.finalize_into_dirty(dest);
         *self = Self::new(config);
+    }
+}
+
+#[cfg(not(feature="lightweight"))]
+#[derive(Clone)]
+struct FixedSizeBlock<D> where D: InnerHash {
+    remaining: usize,
+    data: Vec<u8>,
+    _phantom: std::marker::PhantomData<D>,
+}
+
+#[cfg(not(feature="lightweight"))]
+impl<D: InnerHash> FixedSizeBlock<D> {
+    fn new<S: AsRef<[u8]> + Clone + Default>(config: &FsVerityConfig<D, S>) -> Self {
+        Self { data: Vec::with_capacity(config.block_size), remaining: config.block_size, _phantom: Default::default() }
+    }
+
+    /// Appends data to block, panics if it doesn't fit.
+    fn append(&mut self, data: &[u8]) {
+        self.data.extend_from_slice(data);
+        self.remaining = self.remaining.checked_sub(data.len()).unwrap();
+    }
+
+    /// Fills the remaining space in the block with zero bytes.
+    fn fill_to_end(&mut self) {
+        self.data.extend(repeat(0u8).take(self.remaining));
+        self.remaining = 0;
+    }
+
+    /// Appends as much as possible to the block, returning the data that wouldn't fit.
+    fn overflowing_append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
+        let (a, b) = data.split_at(self.remaining.min(data.len()));
+        self.append(a);
+        b
+    }
+
+    // Returns the final hash of the block, consuming it.
+    fn finalize_into<S: AsRef<[u8]> + Clone + Default>(mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
+        self.fill_to_end();
+        config.salted_digest().chain(&self.data).finalize_into(dest);
+    }
+
+    /// Return the final hash of the block, and then reset its state to a copy of the given block.
+    fn finalize_into_and_reset<S: AsRef<[u8]> + Clone + Default>(&mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
+        self.fill_to_end();
+        config.salted_digest().chain(&self.data).finalize_into(dest);
+        self.data.clear();
+        self.remaining = config.block_size;
     }
 }
 
@@ -245,7 +295,7 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
                 // can't write directly into last_digest because overflow is (sometimes) a
                 // reference to last_digest, so we have to wait until we're done with overflow.
                 let mut tmp: digest::Output<Self> = Default::default();
-                level.finalize_into_and_reset_from(&mut tmp, &self.config);
+                level.finalize_into_and_reset(&mut tmp, &self.config);
                 level.append(overflow);
                 last_digest = tmp;
 
@@ -300,7 +350,7 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         for mut level in self.levels.drain(..) {
             total_size += scale * (self.config.block_size - level.remaining);
             level.append(overflow);
-            level.finalize_into(&mut last_digest);
+            level.finalize_into(&mut last_digest, &self.config);
             overflow = &last_digest;
             scale *= compression_factor;
         }
