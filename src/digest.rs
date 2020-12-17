@@ -1,11 +1,11 @@
 use sha2::digest;
 use digest::{FixedOutputDirty, BlockInput, FixedOutput, Reset, Update};
 use sha2::{Sha256, Sha512};
-use std::{io::Write, iter::repeat};
+use std::{io::Write};
 
 use crate::config::*;
 
-static ZEROES: [u8; 128] = [0u8; 128];
+static ZEROES: [u8; 128] = [0u8; 128];  // sort of arbitrary power of two >= hash input block sizes
 
 /// Trait for the inner hash algorithms we support (currently implemented for [`Sha256`] and [`Sha512`]).
 /// 
@@ -51,14 +51,12 @@ impl InnerHash for Sha512 {
 /// Logically this represents a fixed-size block of data to be hashed (padded with zeroes if needed.)
 /// It actually remembers only the hash state and how many more bytes are needed, not the data itself.
 /// But that's an implementation detail.
-#[cfg(feature="lightweight")]
 #[derive(Clone)]
 struct FixedSizeBlock<D> where D: InnerHash {
     inner: D,
     remaining: usize,
 }
 
-#[cfg(feature="lightweight")]
 impl<D> FixedSizeBlock<D> where D: InnerHash {
     fn new<S: AsRef<[u8]> + Clone + Default>(config: &FsVerityConfig<D, S>) -> Self {
         Self { inner: config.salted_digest(), remaining: config.block_size }
@@ -84,7 +82,7 @@ impl<D> FixedSizeBlock<D> where D: InnerHash {
     }
 
     // Returns the final hash of the block, consuming it.
-    fn finalize_into<S: AsRef<[u8]> + Clone + Default>(mut self, dest: &mut digest::Output<D>, _config: &FsVerityConfig<D, S>) {
+    fn finalize_into(mut self, dest: &mut digest::Output<D>) {
         self.fill_to_end();
         self.inner.finalize_into(dest);
     }
@@ -98,56 +96,9 @@ impl<D> FixedSizeBlock<D> where D: InnerHash {
     }
 }
 
-#[cfg(not(feature="lightweight"))]
+/// Split out so we can pass it to FixedBlock::finalize_into_and_reset while self.levels is borrowed mutably.
 #[derive(Clone)]
-struct FixedSizeBlock<D> where D: InnerHash {
-    remaining: usize,
-    data: Vec<u8>,
-    _phantom: std::marker::PhantomData<D>,
-}
-
-#[cfg(not(feature="lightweight"))]
-impl<D: InnerHash> FixedSizeBlock<D> {
-    fn new<S: AsRef<[u8]> + Clone + Default>(config: &FsVerityConfig<D, S>) -> Self {
-        Self { data: Vec::with_capacity(config.block_size), remaining: config.block_size, _phantom: Default::default() }
-    }
-
-    /// Appends data to block, panics if it doesn't fit.
-    fn append(&mut self, data: &[u8]) {
-        self.data.extend_from_slice(data);
-        self.remaining = self.remaining.checked_sub(data.len()).unwrap();
-    }
-
-    /// Fills the remaining space in the block with zero bytes.
-    fn fill_to_end(&mut self) {
-        self.data.extend(repeat(0u8).take(self.remaining));
-        self.remaining = 0;
-    }
-
-    /// Appends as much as possible to the block, returning the data that wouldn't fit.
-    fn overflowing_append<'a>(&mut self, data: &'a [u8]) -> &'a [u8] {
-        let (a, b) = data.split_at(self.remaining.min(data.len()));
-        self.append(a);
-        b
-    }
-
-    // Returns the final hash of the block, consuming it.
-    fn finalize_into<S: AsRef<[u8]> + Clone + Default>(mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
-        self.fill_to_end();
-        config.salted_digest().chain(&self.data).finalize_into(dest);
-    }
-
-    /// Return the final hash of the block, and then reset its state to a copy of the given block.
-    fn finalize_into_and_reset<S: AsRef<[u8]> + Clone + Default>(&mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
-        self.fill_to_end();
-        config.salted_digest().chain(&self.data).finalize_into(dest);
-        self.data.clear();
-        self.remaining = config.block_size;
-    }
-}
-
-#[derive(Clone)]
-pub struct FsVerityConfig<D=Sha256, S=[u8; 0]> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+struct FsVerityConfig<D=Sha256, S=[u8; 0]> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
     block_size: usize,
     /// We have to keep the actual salt around (not just its digest) as it is needed for the final hash operation.
     salt: S,
@@ -176,6 +127,7 @@ impl<D, S> FsVerityConfig<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
     }
 }
 
+/// Calculates an fs-verity measurement over the input data.
 #[derive(Clone)]
 pub struct FsVerityDigest<D=Sha256, S=[u8; 0]> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
     config: FsVerityConfig<D, S>,
@@ -213,7 +165,7 @@ impl<D, S> FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
     /// Creates a new instance of `FsVerityDigest` with the given salt. The salt will be mixed
     /// into every internal hash calculation.
     ///
-    /// Note that the current Linux kernel does not allow you to read the salt used for a
+    /// Note that the current Linux kernel does not allow you to read back the salt used for a
     /// particular verity-protected file, which may be a problem depending on your use case.
     ///
     /// This will panic if the salt is longer than [`MAX_SALT_SIZE`] bytes.
@@ -264,6 +216,8 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
         // the reason for the asymmetry between flushing of level[0] and the others is that it makes
         // flushing the final state (at the end of file) a lot simpler, because it guarantees that
         // each level will produce exactly one more digest for the next level during the final flush.
+        // things could be a bit simpler if we always got input data in multiples of block_size and
+        // if we knew the amount of data ahead of time so we could special-case the last block.
         for chunk in data.as_ref().chunks(self.config.block_size) {
 
             // keep moving up the hierarchy as long as dealing with the current level produces data
@@ -350,7 +304,7 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         for mut level in self.levels.drain(..) {
             total_size += scale * (self.config.block_size - level.remaining);
             level.append(overflow);
-            level.finalize_into(&mut last_digest, &self.config);
+            level.finalize_into(&mut last_digest);
             overflow = &last_digest;
             scale *= compression_factor;
         }
