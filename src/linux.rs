@@ -1,3 +1,10 @@
+//! Functions to enable `fs-verity` on a file and to return its hash.
+//!
+//! This functionality depends on certain kernel and filesystem features. The Linux kernel documentation for
+//! `fs-verity` has some very good information about the requirements:
+//!
+//! <https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#filesystem-support>
+
 #[allow(non_camel_case_types)]
 
 use std::convert::TryFrom;
@@ -10,7 +17,12 @@ use super::config;
 const FS_IOC_ENABLE_VERITY: u64 = 1082156677;
 const FS_IOC_MEASURE_VERITY: u64 = 3221513862;
 
-// https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-ioc-enable-verity
+/// Enables `fs-verity` on the given file, with the given block size, hash algorithm, and salt.
+///
+/// See Linux kernel documentation for the `FS_IOC_ENABLE_VERITY` ioctl for details, especially about
+/// the meaning of error codes:
+///
+/// <https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-ioc-enable-verity>
 pub fn fsverity_enable(fd: impl AsRawFd, block_size: usize, hash: config::InnerHashAlgorithm, salt: &[u8]) -> std::io::Result<()> {
     let fd = fd.as_raw_fd();
     #[repr(C)]
@@ -48,7 +60,12 @@ pub fn fsverity_enable(fd: impl AsRawFd, block_size: usize, hash: config::InnerH
     }
 }
 
-// https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-ioc-measure-verity
+/// Retrieves the current `fs-verity` measurement for the given file.
+///
+/// See Linux kernel documentation for the `FS_IOC_MEASURE_VERITY` ioctl for details, especially about
+/// the meaning of error codes:
+///
+/// <https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-ioc-measure-verity>
 pub fn fsverity_measure(fd: impl AsRawFd) -> std::io::Result<(config::InnerHashAlgorithm, Box<[u8]>)> {
     let fd = fd.as_raw_fd();
     #[repr(C)]

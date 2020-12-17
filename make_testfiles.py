@@ -32,7 +32,6 @@ def testfile(id):
     print("writing {}...".format(fn))
     yield f
     f.close()
-    os.system('fsverity enable {}'.format(fn))
 
 with testfile('empty') as f:
     f.write(b'')

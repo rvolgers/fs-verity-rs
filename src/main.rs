@@ -4,7 +4,7 @@ use fs_verity::FsVeritySha256;
 use sha2::Digest;
 
 #[cfg(target_os = "linux")]
-use fs_verity::linux::*;
+use fs_verity::linux::fsverity_measure;
 
 fn main() -> Result<()> {
 

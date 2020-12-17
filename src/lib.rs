@@ -37,17 +37,14 @@
 //! accepting any amount of input in chunks of whatever size.
 
 #![feature(str_split_once)]
-#![feature(slice_fill)]
+
 
 mod config;
 
 pub use config::*;
 
 #[cfg(target_os = "linux")]
-mod linux;
-
-#[cfg(target_os = "linux")]
-pub use linux::*;
+pub mod linux;
 
 mod digest;
 
