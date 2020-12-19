@@ -38,7 +38,6 @@
 
 #![feature(str_split_once)]
 
-
 mod config;
 
 pub use config::*;

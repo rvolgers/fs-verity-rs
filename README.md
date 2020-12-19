@@ -80,6 +80,8 @@ Very recent versions (you may have to compile from [source](https://git.kernel.o
 fsverity digest testfiles/*
 ```
 
+Converting this to pure Rust would be nice.
+
 ## License
 
 This crate is licensed under either of

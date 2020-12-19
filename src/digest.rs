@@ -13,7 +13,7 @@ static ZEROES: [u8; 128] = [0u8; 128];  // sort of arbitrary power of two >= has
 /// so we have them in one place.
 pub trait InnerHash: Update + FixedOutputDirty + Reset + Clone + Default + BlockInput {
     /// The value of [`InnerHashAlgorithm`] that corresponds to this hash algorithm.
-    const VERITY_HASH_ALGORITHM: InnerHashAlgorithm;
+    const INNER_HASH_ALGORITHM: InnerHashAlgorithm;
 
     /// Update the hash state with given data, padded with zero bytes to the given size.
     /// This will panic if `data.len() > padded_size`.
@@ -31,21 +31,23 @@ pub trait InnerHash: Update + FixedOutputDirty + Reset + Clone + Default + Block
 
     /// The size in bytes of the digests produced by this hash function
     fn digest_output_size() -> usize {
+        // can't be an associated const, https://github.com/paholg/typenum/issues/112
         <Self::OutputSize as digest::generic_array::typenum::Unsigned>::to_usize()
     }
 
     /// The native input block size of this hash function (in bytes)
     fn digest_block_size() -> usize {
+        // can't be an associated const, https://github.com/paholg/typenum/issues/112
         <Self::BlockSize as digest::generic_array::typenum::Unsigned>::to_usize()
     }
 }
 
 impl InnerHash for Sha256 {
-    const VERITY_HASH_ALGORITHM: InnerHashAlgorithm = InnerHashAlgorithm::Sha256;
+    const INNER_HASH_ALGORITHM: InnerHashAlgorithm = InnerHashAlgorithm::Sha256;
 }
 
 impl InnerHash for Sha512 {
-    const VERITY_HASH_ALGORITHM: InnerHashAlgorithm = InnerHashAlgorithm::Sha512;
+    const INNER_HASH_ALGORITHM: InnerHashAlgorithm = InnerHashAlgorithm::Sha512;
 }
 
 /// Logically this represents a fixed-size block of data to be hashed (padded with zeroes if needed.)
@@ -113,7 +115,11 @@ impl<D, S> FsVerityConfig<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
         assert!(block_size >= D::digest_output_size() * 2);
         assert!(D::digest_output_size() <= MAX_DIGEST_SIZE);
 
-        let salted_digest = salted_digest(salt.as_ref());
+        let mut salted_digest = <D as digest::Digest>::new();
+        // in practice this will run either 0 or 1 iterations, due to low MAX_SALT_SIZE
+        for chunk in salt.as_ref().chunks(D::digest_block_size()) {
+            salted_digest.update_padded(chunk, D::digest_block_size());
+        }
 
         Self {
             block_size,
@@ -122,28 +128,24 @@ impl<D, S> FsVerityConfig<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
         }
     }
 
+    /// Returns an instance of the hash algorithm which has been fed the given salt,
+    /// zero-padded to a multiple of the hash algorithm's input block size.
     fn salted_digest(&self) -> D {
         self.salted_digest.clone()
+    }
+
+    fn inner_hash_algorithm(&self) -> InnerHashAlgorithm {
+        D::INNER_HASH_ALGORITHM
     }
 }
 
 /// Calculates an fs-verity measurement over the input data.
 #[derive(Clone)]
 pub struct FsVerityDigest<D=Sha256, S=[u8; 0]> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+    /// The parameters of the verity hash
     config: FsVerityConfig<D, S>,
     /// The currently relevant hierarchy of blocks in the Merkle tree.
     levels: Vec<FixedSizeBlock<D>>,
-}
-
-/// Returns an instance of the hash algorithm which has been fed the given salt,
-/// zero-padded to a multiple of the hash algorithm's input block size.
-fn salted_digest<D: InnerHash>(salt: &[u8]) -> D {
-    let mut tmp = <D as digest::Digest>::new();
-    // in practice this will run either 0 or 1 iterations, due to low MAX_SALT_SIZE
-    for chunk in salt.chunks(D::digest_block_size()) {
-        tmp.update_padded(chunk, D::digest_block_size());
-    }
-    tmp
 }
 
 impl<D> FsVerityDigest<D> where D: InnerHash {
@@ -157,10 +159,6 @@ impl<D> FsVerityDigest<D> where D: InnerHash {
 }
 
 impl<D, S> FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
-
-    pub fn inner_hash_algorithm(&self) -> InnerHashAlgorithm {
-        D::VERITY_HASH_ALGORITHM
-    }
 
     /// Creates a new instance of `FsVerityDigest` with the given salt. The salt will be mixed
     /// into every internal hash calculation.
@@ -179,7 +177,8 @@ impl<D, S> FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
     ///
     /// If you want to be compatible with the Linux kernel implementation it is *not* a good idea
     /// to change the `block_size`, as the kernel currently requires it to be equal to the system
-    /// page size, which is 4096 on just about every relevant architecture.
+    /// page size, which is 4096 on most architectures. Some modern 64 bit ARM systems [have a
+    /// 64kB page size](https://www.kernel.org/doc/Documentation/arm64/memory.txt) though.
     ///
     /// The block size must be a power of two, and it must be at least twice the size of the
     /// digests produced by the inner hash algorithm. This code will panic otherwise.
@@ -191,6 +190,11 @@ impl<D, S> FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
             config,
             levels: vec![],
         }
+    }
+
+    /// Returns the [`InnerHashAlgorithm`] value corresponding to the used inner hash algorithm.
+    pub fn inner_hash_algorithm(&self) -> InnerHashAlgorithm {
+        self.config.inner_hash_algorithm()
     }
 }
 
@@ -314,9 +318,9 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         // and it is called a 'verity measurement'.
         // https://www.kernel.org/doc/html/latest/filesystems/fsverity.html#fs-verity-descriptor
 
-        let mut descriptor: D = salted_digest(self.config.salt.as_ref());
+        let mut descriptor: D = self.config.salted_digest();
         descriptor.update(&[1]);
-        descriptor.update(&[D::VERITY_HASH_ALGORITHM as u8]);
+        descriptor.update(&[self.config.inner_hash_algorithm() as u8]);
         descriptor.update(&[self.config.block_size.trailing_zeros() as u8]);
         descriptor.update(&[self.config.salt.as_ref().len() as u8]);
         descriptor.update(&[0; 4]);
@@ -359,22 +363,57 @@ impl<D, S> Write for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + C
     }
 }
 
-/// For trait objects of [`FsVerityDigest`], when the inner hash is not statically known (see [`DigestSpec`])
-pub trait DynDigestWrite: sha2::digest::DynDigest + Write {}
-impl<D: InnerHash + 'static, S: AsRef<[u8]> + Clone + Default + 'static> DynDigestWrite for FsVerityDigest<D, S> {}
-
 /// Alias for `FsVerityDigest<Sha256>`
 pub type FsVeritySha256<S> = FsVerityDigest<Sha256, S>;
 
 /// Alias for `FsVerityDigest<Sha512>`
 pub type FsVeritySha512<S> = FsVerityDigest<Sha512, S>;
 
+/// For trait objects of [`FsVerityDigest`], when the inner hash is not statically known
+pub trait DynFsVerityDigest: sha2::digest::DynDigest + Write {
+    fn inner_hash_algorithm(&self) -> InnerHashAlgorithm;
+}
+impl<D: InnerHash + 'static, S: AsRef<[u8]> + Clone + Default + 'static> DynFsVerityDigest for FsVerityDigest<D, S> {
+    fn inner_hash_algorithm(&self) -> InnerHashAlgorithm {
+        self.config.inner_hash_algorithm()
+    }
+}
+
+/// Like [`FsVerityDigest::new`], but you can choose the hash algorithm at runtime.
+pub fn new_dyn(inner_hash: InnerHashAlgorithm) -> Box<dyn DynFsVerityDigest> {
+    match inner_hash {
+        InnerHashAlgorithm::Sha256 => { Box::new(FsVeritySha256::new()) }
+        InnerHashAlgorithm::Sha512 => { Box::new(FsVeritySha512::new()) }
+    }
+}
+
+/// Like [`FsVerityDigest::new_with_salt`], but you can choose the hash algorithm at runtime.
+///
+/// Please check the linked function for additional notes about specifying a salt.
+pub fn new_dyn_with_salt<S: AsRef<[u8]> + Clone + Default + 'static>(inner_hash: InnerHashAlgorithm, salt: S) -> Box<dyn DynFsVerityDigest> {
+    match inner_hash {
+        InnerHashAlgorithm::Sha256 => { Box::new(FsVeritySha256::new_with_salt(salt)) }
+        InnerHashAlgorithm::Sha512 => { Box::new(FsVeritySha512::new_with_salt(salt)) }
+    }
+}
+
+/// Like [`FsVerityDigest::new_with_salt_and_block_size`], but you can choose the hash algorithm at runtime.
+///
+/// Please check the linked function for additional notes about specifying a salt and block size.
+pub fn new_dyn_with_salt_and_block_size<S: AsRef<[u8]> + Clone + Default + 'static>(inner_hash: InnerHashAlgorithm, salt: S, block_size: usize) -> Box<dyn DynFsVerityDigest> {
+    match inner_hash {
+        InnerHashAlgorithm::Sha256 => { Box::new(FsVeritySha256::new_with_salt_and_block_size(salt, block_size)) }
+        InnerHashAlgorithm::Sha512 => { Box::new(FsVeritySha512::new_with_salt_and_block_size(salt, block_size)) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::DynDigestWrite;
     use std::io::BufReader;
     use std::fs::File;
     use crate::InnerHashAlgorithm;
+
+    use super::new_dyn;
 
     #[test]
     fn test_testfiles() {
@@ -408,7 +447,7 @@ mod tests {
         for (digest_type, digest, path) in testfiles {
             assert!(digest_type == InnerHashAlgorithm::Sha256);
             let mut f = BufReader::new(File::open(path).unwrap());
-            let mut tmp: Box<dyn DynDigestWrite> = digest_type.into();
+            let mut tmp = new_dyn(digest_type);
             std::io::copy(&mut f, &mut tmp).unwrap();
             let out = tmp.finalize();
 

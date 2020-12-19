@@ -16,11 +16,12 @@ fn main() -> Result<()> {
         let digest = d.finalize();
         println!("{}:{} {}", algo, hex::encode(digest), &arg);
 
-        #[cfg(target_os = "linux")]
-        {
-            let (algo, digest) = fsverity_measure(File::open(&arg)?)?;
-            println!("{}:{} {}", algo, hex::encode(digest), &arg);
-        }
+        // For comparison with the native value
+        // #[cfg(target_os = "linux")]
+        // {
+        //     let (algo, digest) = fsverity_measure(File::open(&arg)?)?;
+        //     println!("{}:{} {}", algo, hex::encode(digest), &arg);
+        // }
     }
 
     Ok(())
