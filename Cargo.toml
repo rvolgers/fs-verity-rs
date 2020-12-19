@@ -4,6 +4,9 @@ version = "0.1.0"
 authors = ["Ronald Volgers <rvolgers@users.noreply.github.com>"]
 edition = "2018"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/rvolgers/fs-verity-rs"
+categories = ["os::linux-apis", "algorithms", "cryptography", "filesystem"]
+keywords = ["fs-verity", "hash", "digest", "verity"]
 
 [dependencies]
 libc = "0.2.81"
