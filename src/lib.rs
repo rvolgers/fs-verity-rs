@@ -36,8 +36,6 @@
 //! One neat aspect of this implementation is that it works in a completely streaming manner,
 //! accepting any amount of input in chunks of whatever size.
 
-#![feature(str_split_once)]
-
 mod config;
 
 pub use config::*;
