@@ -62,10 +62,10 @@ The underlying SHA256 and SHA512 hash functions from Rust Crypto are used. The `
 
 To run unit tests, first generate the test files using `python3 make_testfiles.py`.
 
-The "known good" hashes were generated using the official `fsverity` tool fromm `fsverity-utils`:
+The "known good" hashes were generated using the official `fsverity` tool from the `fsverity-utils` or 'fsverity` package:
 
 ```bash
-sudo apt install fsverity-utils
+sudo apt install fsverity
 for f in testfiles/*; do fsverity enable $f; done
 fsverity measure testfiles/*
 ```
