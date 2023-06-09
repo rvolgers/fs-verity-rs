@@ -1,7 +1,7 @@
-use sha2::digest;
-use digest::{FixedOutputDirty, BlockInput, FixedOutput, Reset, Update};
+use sha2::digest::{self, OutputSizeUser, FixedOutputReset, FixedOutput, Reset, Update, Digest, HashMarker};
+use sha2::digest::{generic_array::typenum::Unsigned, crypto_common::BlockSizeUser};
 use sha2::{Sha256, Sha512};
-use std::{io::Write};
+use std::{io::Write, mem};
 
 use crate::config::*;
 
@@ -11,7 +11,7 @@ static ZEROES: [u8; 128] = [0u8; 128];  // sort of arbitrary power of two >= has
 /// 
 /// It adds some information we need, some useful functions, and declares all the trait bounds we need
 /// so we have them in one place.
-pub trait InnerHash: Update + FixedOutputDirty + Reset + Clone + Default + BlockInput {
+pub trait InnerHash: Digest + BlockSizeUser + Clone + Default {
     /// The value of [`InnerHashAlgorithm`] that corresponds to this hash algorithm.
     const INNER_HASH_ALGORITHM: InnerHashAlgorithm;
 
@@ -27,18 +27,6 @@ pub trait InnerHash: Update + FixedOutputDirty + Reset + Clone + Default + Block
         let (quotient, remainder) = (amount / ZEROES.len(), amount % ZEROES.len());
         if remainder != 0 { self.update(&ZEROES[..remainder]); }
         for _ in 0..quotient { self.update(&ZEROES); }
-    }
-
-    /// The size in bytes of the digests produced by this hash function
-    fn digest_output_size() -> usize {
-        // can't be an associated const, https://github.com/paholg/typenum/issues/112
-        <Self::OutputSize as digest::generic_array::typenum::Unsigned>::to_usize()
-    }
-
-    /// The native input block size of this hash function (in bytes)
-    fn digest_block_size() -> usize {
-        // can't be an associated const, https://github.com/paholg/typenum/issues/112
-        <Self::BlockSize as digest::generic_array::typenum::Unsigned>::to_usize()
     }
 }
 
@@ -92,9 +80,10 @@ impl<D> FixedSizeBlock<D> where D: InnerHash {
     /// Return the final hash of the block, and then reset its state to a copy of the given block.
     fn finalize_into_and_reset<S: AsRef<[u8]> + Clone + Default>(&mut self, dest: &mut digest::Output<D>, config: &FsVerityConfig<D, S>) {
         self.fill_to_end();
-        // using the dirty variant is okay because we overwrite all our state right after this
-        self.inner.finalize_into_dirty(dest);
-        *self = Self::new(config);
+
+        let Self {inner, ..} = mem::replace(self, Self::new(config));
+
+        inner.finalize_into(dest);
     }
 }
 
@@ -112,13 +101,13 @@ impl<D, S> FsVerityConfig<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Def
         // TODO error instead of panic?
         assert!(salt.as_ref().len() <= MAX_SALT_SIZE);
         assert!(block_size.is_power_of_two());
-        assert!(block_size >= D::digest_output_size() * 2);
-        assert!(D::digest_output_size() <= MAX_DIGEST_SIZE);
+        assert!(block_size >= D::OutputSize::USIZE * 2);
+        assert!(D::OutputSize::USIZE <= MAX_DIGEST_SIZE);
 
         let mut salted_digest = <D as digest::Digest>::new();
         // in practice this will run either 0 or 1 iterations, due to low MAX_SALT_SIZE
-        for chunk in salt.as_ref().chunks(D::digest_block_size()) {
-            salted_digest.update_padded(chunk, D::digest_block_size());
+        for chunk in salt.as_ref().chunks(D::BlockSize::USIZE) {
+            salted_digest.update_padded(chunk, D::BlockSize::USIZE);
         }
 
         Self {
@@ -204,7 +193,7 @@ impl<D, S> Default for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> +
 
 impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
 
-    fn update(&mut self, data: impl AsRef<[u8]>) {
+    fn update(&mut self, data: &[u8]) {
         // self.levels represents the hierarchy of currently-relevant Merkle tree blocks.
         // level 0 is filled with input data. when the block at level n fills up, the hash of its
         // contents is appended to the block at level n + 1, and it is reset to an empty state.
@@ -241,7 +230,7 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
                 overflow = level.overflowing_append(overflow);
                 if keep_space_for_one_digest {
                     // done if there is enough space left in this level for one full digest
-                    if level.remaining >= D::digest_output_size() {
+                    if level.remaining >= D::OutputSize::USIZE {
                         assert!(overflow.len() == 0);  // if remaining > 0 there can't be overflow
                         break;
                     }
@@ -277,12 +266,15 @@ impl<D, S> Update for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + 
     }
 }
 
-impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+impl<D, S> OutputSizeUser for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
     type OutputSize = D::OutputSize;
+}
 
-    fn finalize_into_dirty(&mut self, out: &mut digest::Output<D>) {
+impl<D, S> FixedOutput for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
 
-        // a block is block_size bytes; a digest is D::digest_output_size() bytes.
+    fn finalize_into(mut self, out: &mut digest::Output<Self>) {
+
+        // a block is block_size bytes; a digest is D::OutputSize::USIZE bytes.
         // dividing them gives the "compression factor", meaning how many times smaller the
         // representation of the data becomes each time it moves up a level in the tree.
         // this means that for every level we go up, each byte in that level represents
@@ -291,7 +283,7 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
         // of bytes written to each level. this is needed to calculate the final digest.
         // we could also have tracked the number of bytes written directly of course, but
         // besides showing off I guess this is a good consistency check.
-        let compression_factor = self.config.block_size / D::digest_output_size();
+        let compression_factor = self.config.block_size / D::OutputSize::USIZE;
         let mut total_size: usize = 0;
         let mut scale: usize = 1;  // at level[0], each byte represents 1 input byte
 
@@ -331,6 +323,8 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
 
         descriptor.finalize_into(out);
     }
+
+
 }
 
 /// NOTE: This reports the base hash function's input block size, *not* the Merkle tree block size you
@@ -339,9 +333,9 @@ impl<D, S> FixedOutputDirty for FsVerityDigest<D, S> where D: InnerHash, S: AsRe
 /// While this may be confusing, it is probably more faithful to the purpose of the `BlockInput` trait.
 /// We don't need to buffer an entire Merkle tree block in memory; data can be efficiently processed
 /// in chunks of the base hash's input block size.
-impl<D, S> BlockInput for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+impl<D, S> BlockSizeUser for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
     /// Equal to the inner hash algorithm's block size.
-    type BlockSize = <D as BlockInput>::BlockSize;
+    type BlockSize = D::BlockSize;
 }
 
 /// Resets to a blank state, but with the same Merkle tree block size and salt
@@ -352,15 +346,28 @@ impl<D, S> Reset for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + C
     }
 }
 
+impl<D, S> FixedOutputReset for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+     fn finalize_into_reset(&mut self, out: &mut digest::Output<Self>) {
+        // Pretty basic implementation but good enough
+        let new = Self::new_with_salt_and_block_size(self.config.salt.clone(), self.config.block_size);
+        let old = mem::replace(self, new);
+        FixedOutput::finalize_into(old, out);
+     }
+}
+
 impl<D, S> Write for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.update(buf);
+        Update::update(self, buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+impl<D, S> HashMarker for FsVerityDigest<D, S> where D: InnerHash, S: AsRef<[u8]> + Clone + Default {
+
 }
 
 /// Alias for `FsVerityDigest<Sha256>`
