@@ -52,8 +52,8 @@ pub fn fsverity_enable(fd: impl AsRawFd, block_size: usize, hash: config::InnerH
 
     let ret = unsafe { libc::ioctl(fd, FS_IOC_ENABLE_VERITY, &args as *const _) };
 
-    if ret != 0 {
-        Err(std::io::Error::from_raw_os_error(ret))
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
     }
     else {
         Ok(())
@@ -83,8 +83,8 @@ pub fn fsverity_measure(fd: impl AsRawFd) -> std::io::Result<(config::InnerHashA
 
     let ret = unsafe { libc::ioctl(fd, FS_IOC_MEASURE_VERITY, &mut digest as *mut _) };
 
-    if ret != 0 {
-        Err(std::io::Error::from_raw_os_error(ret))
+    if ret < 0 {
+        Err(std::io::Error::last_os_error())
     }
     else {
         Ok((
