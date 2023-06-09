@@ -50,9 +50,7 @@ accepting any amount of input in chunks of whatever size.
 
 ## Rust version
 
-This crate currently requires nightly just because I used `#\[feature(str_split_once)\]` in the tests.
-
-If you don't like nightly either help out to [stabilize that feature](https://github.com/rust-lang/rust/issues/74773) or send me a PR to remove the use of it.
+This crate should work with latest stable Rust. In case it does not work with older versions of Rust and you need this, please file an issue.
 
 ## Safety
 
