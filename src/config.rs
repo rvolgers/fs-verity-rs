@@ -15,6 +15,7 @@ pub const MAX_LEVELS: usize = 8;
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
 
 // So we can have easy cross references in doc comments
+#[cfg(doc)]
 use super::*;
 
 /// Enum of the supported inner hash algorithms.
