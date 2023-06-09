@@ -3,8 +3,8 @@ use std::{env::args, fs::File, io::{BufReader, Result}};
 use fs_verity::FsVeritySha256;
 use sha2::Digest;
 
-#[cfg(target_os = "linux")]
-use fs_verity::linux::fsverity_measure;
+// #[cfg(target_os = "linux")]
+// use fs_verity::linux::fsverity_measure;
 
 fn main() -> Result<()> {
 
